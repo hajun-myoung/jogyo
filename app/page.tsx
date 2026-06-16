@@ -1,6 +1,21 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { ChangeEvent, FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  CLOCK_THEMES,
+  normalizeThemeId,
+  type ClockTheme,
+  type ThemeId
+} from "./lib/themes";
+import {
+  createPresetId,
+  safeReadLastSettings,
+  safeReadPresets,
+  safeWriteLastSettings,
+  safeWritePresets,
+  type ClockPreset,
+  type LastSettings
+} from "./lib/storage";
 
 type ExamSettings = {
   title: string;
@@ -10,6 +25,7 @@ type ExamSettings = {
 
 type FullscreenStatus = "checking" | "supported" | "unsupported";
 type NoticeTone = "info" | "warning" | "danger";
+type ClockStatus = "waiting" | "running" | "paused" | "ended";
 
 type Notice = {
   message: string;
@@ -23,8 +39,11 @@ const DEFAULT_NOTICE = [
   "종료 후 감독 안내에 따라 제출하세요"
 ].join("\n");
 
+const DEFAULT_ORGANIZATION_NAME = "Jogyo Clock";
 const MINUTE_MS = 60 * 1000;
 const NOTICE_TIMEOUT_MS = 4000;
+const LAST_SETTINGS_DEBOUNCE_MS = 500;
+const LOGO_MAX_BYTES = 1024 * 1024;
 
 function padTime(value: number) {
   return value.toString().padStart(2, "0");
@@ -59,6 +78,13 @@ function formatCompactDuration(totalMilliseconds: number) {
   }
 
   return `${seconds}초`;
+}
+
+function formatUpdatedAt(timestamp: number) {
+  const date = new Date(timestamp);
+  return `${padTime(date.getMonth() + 1)}/${padTime(date.getDate())} ${padTime(
+    date.getHours()
+  )}:${padTime(date.getMinutes())}`;
 }
 
 function createDefaultSettings(nowMs = Date.now()): ExamSettings {
@@ -128,6 +154,27 @@ function isFormField(target: EventTarget | null) {
   return ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
 }
 
+function getLastSettingsFromDraft({
+  draftSettings,
+  themeId,
+  organizationName,
+  logoDataUrl
+}: {
+  draftSettings: ExamSettings;
+  themeId: ThemeId;
+  organizationName: string;
+  logoDataUrl: string | null;
+}): LastSettings {
+  return {
+    examTitle: draftSettings.title.trim() || "기말고사",
+    endTimeInput: draftSettings.endTime,
+    instructions: draftSettings.notice,
+    themeId,
+    organizationName: organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
+    logoDataUrl
+  };
+}
+
 export default function ExamClockPage() {
   const [examTitle, setExamTitle] = useState("기말고사");
   const [instructions, setInstructions] = useState(DEFAULT_NOTICE);
@@ -137,6 +184,15 @@ export default function ExamClockPage() {
     endTime: "",
     notice: DEFAULT_NOTICE
   });
+  const [themeId, setThemeId] = useState<ThemeId>("defaultDark");
+  const [organizationName, setOrganizationName] = useState(
+    DEFAULT_ORGANIZATION_NAME
+  );
+  const [logoDataUrl, setLogoDataUrl] = useState<string | null>(null);
+  const [presets, setPresets] = useState<ClockPreset[]>([]);
+  const [currentPresetId, setCurrentPresetId] = useState<string | null>(null);
+  const [presetName, setPresetName] = useState("기말고사");
+  const [hasLoadedSettings, setHasLoadedSettings] = useState(false);
   const [nowMs, setNowMs] = useState<number | null>(null);
   const [setupOpen, setSetupOpen] = useState(true);
   const [isStarted, setIsStarted] = useState(false);
@@ -150,23 +206,102 @@ export default function ExamClockPage() {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
 
+  const theme = CLOCK_THEMES[themeId];
+
   const showNotice = useCallback((nextNotice: Notice) => {
     setNotice(nextNotice);
   }, []);
 
+  const applyEndDateTime = useCallback((nextEndDateTime: number | null) => {
+    setEndDateTime(nextEndDateTime);
+
+    if (nextEndDateTime !== null) {
+      setDraftSettings((current) => ({
+        ...current,
+        endTime: formatTimeOnly(new Date(nextEndDateTime))
+      }));
+    }
+  }, []);
+
+  const applyLoadedSettings = useCallback(
+    (settings: LastSettings, options?: { presetId?: string | null }) => {
+      const currentNowMs = Date.now();
+      const fallbackSettings = createDefaultSettings(currentNowMs);
+      const parsedEndDateTime = parseTodayEndDateTime(
+        settings.endTimeInput,
+        currentNowMs
+      );
+      const nextEndDateTime =
+        parsedEndDateTime ??
+        parseTodayEndDateTime(fallbackSettings.endTime, currentNowMs);
+      const nextDraftSettings = {
+        title: settings.examTitle.trim() || "기말고사",
+        endTime: parsedEndDateTime ? settings.endTimeInput : fallbackSettings.endTime,
+        notice: settings.instructions
+      };
+
+      setExamTitle(nextDraftSettings.title);
+      setInstructions(nextDraftSettings.notice);
+      setDraftSettings(nextDraftSettings);
+      setPresetName(nextDraftSettings.title);
+      setThemeId(normalizeThemeId(settings.themeId));
+      setOrganizationName(
+        settings.organizationName.trim() || DEFAULT_ORGANIZATION_NAME
+      );
+      setLogoDataUrl(settings.logoDataUrl || null);
+      setCurrentPresetId(options?.presetId ?? null);
+      setEndDateTime(nextEndDateTime);
+      setIsStarted(true);
+      setIsPaused(false);
+      setPausedAt(null);
+      setPausedRemainingMs(null);
+
+      if (!parsedEndDateTime) {
+        showNotice({
+          message: "종료 시각을 기본값으로 대체했습니다",
+          detail: "불러온 설정의 종료 시각 형식이 올바르지 않습니다",
+          tone: "warning"
+        });
+      }
+    },
+    [showNotice]
+  );
+
   useEffect(() => {
     const initialNow = Date.now();
-    const initialSettings = createDefaultSettings(initialNow);
-    const initialEndDateTime = parseTodayEndDateTime(
-      initialSettings.endTime,
-      initialNow
-    );
+    const defaultSettings = createDefaultSettings(initialNow);
+    const lastSettings = safeReadLastSettings();
+    const initialSettings: LastSettings = lastSettings ?? {
+      examTitle: defaultSettings.title,
+      endTimeInput: defaultSettings.endTime,
+      instructions: defaultSettings.notice,
+      themeId: "defaultDark",
+      organizationName: DEFAULT_ORGANIZATION_NAME,
+      logoDataUrl: null
+    };
+    const initialEndDateTime =
+      parseTodayEndDateTime(initialSettings.endTimeInput, initialNow) ??
+      parseTodayEndDateTime(defaultSettings.endTime, initialNow);
 
     setNowMs(initialNow);
-    setExamTitle(initialSettings.title);
-    setInstructions(initialSettings.notice);
+    setExamTitle(initialSettings.examTitle);
+    setInstructions(initialSettings.instructions);
     setEndDateTime(initialEndDateTime);
-    setDraftSettings(initialSettings);
+    setDraftSettings({
+      title: initialSettings.examTitle,
+      endTime: parseTodayEndDateTime(initialSettings.endTimeInput, initialNow)
+        ? initialSettings.endTimeInput
+        : defaultSettings.endTime,
+      notice: initialSettings.instructions
+    });
+    setThemeId(normalizeThemeId(initialSettings.themeId));
+    setOrganizationName(
+      initialSettings.organizationName.trim() || DEFAULT_ORGANIZATION_NAME
+    );
+    setLogoDataUrl(initialSettings.logoDataUrl || null);
+    setPresetName(initialSettings.examTitle || "기말고사");
+    setPresets(safeReadPresets());
+    setHasLoadedSettings(true);
 
     const tick = window.setInterval(() => {
       setNowMs(Date.now());
@@ -176,6 +311,27 @@ export default function ExamClockPage() {
       window.clearInterval(tick);
     };
   }, []);
+
+  useEffect(() => {
+    if (!hasLoadedSettings) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      safeWriteLastSettings(
+        getLastSettingsFromDraft({
+          draftSettings,
+          themeId,
+          organizationName,
+          logoDataUrl
+        })
+      );
+    }, LAST_SETTINGS_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [draftSettings, hasLoadedSettings, logoDataUrl, organizationName, themeId]);
 
   useEffect(() => {
     if (!notice) {
@@ -227,24 +383,13 @@ export default function ExamClockPage() {
       endDateTime !== null &&
       endDateTime <= nowMs
   );
-  const currentStatus = isPaused
+  const currentStatus: ClockStatus = isPaused
     ? "paused"
     : isEnded
       ? "ended"
       : isStarted
         ? "running"
         : "waiting";
-
-  const applyEndDateTime = useCallback((nextEndDateTime: number | null) => {
-    setEndDateTime(nextEndDateTime);
-
-    if (nextEndDateTime !== null) {
-      setDraftSettings((current) => ({
-        ...current,
-        endTime: formatTimeOnly(new Date(nextEndDateTime))
-      }));
-    }
-  }, []);
 
   const addMinutesToEnd = useCallback(
     (minutes: number) => {
@@ -441,32 +586,179 @@ export default function ExamClockPage() {
     });
   };
 
+  const handleLogoUpload = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) {
+      return;
+    }
+
+    if (file.size > LOGO_MAX_BYTES) {
+      showNotice({
+        message: "로고 파일은 1MB 이하만 사용할 수 있습니다",
+        tone: "warning"
+      });
+      return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      if (typeof reader.result === "string") {
+        setLogoDataUrl(reader.result);
+        showNotice({
+          message: "로고가 적용되었습니다",
+          tone: "info"
+        });
+        return;
+      }
+
+      showNotice({
+        message: "로고 파일을 읽지 못했습니다",
+        tone: "warning"
+      });
+    };
+
+    reader.onerror = () => {
+      showNotice({
+        message: "로고 파일을 읽지 못했습니다",
+        tone: "warning"
+      });
+    };
+
+    reader.readAsDataURL(file);
+  };
+
+  const buildPreset = (presetId: string, createdAt: number): ClockPreset => {
+    const savedSettings = getLastSettingsFromDraft({
+      draftSettings,
+      themeId,
+      organizationName,
+      logoDataUrl
+    });
+    const timestamp = Date.now();
+
+    return {
+      id: presetId,
+      name: presetName.trim() || savedSettings.examTitle,
+      examTitle: savedSettings.examTitle,
+      endTimeInput: savedSettings.endTimeInput,
+      instructions: savedSettings.instructions,
+      themeId: savedSettings.themeId,
+      organizationName: savedSettings.organizationName,
+      logoDataUrl: savedSettings.logoDataUrl,
+      createdAt,
+      updatedAt: timestamp
+    };
+  };
+
+  const commitPresets = (nextPresets: ClockPreset[]) => {
+    const sortedPresets = [...nextPresets].sort((a, b) => b.updatedAt - a.updatedAt);
+    setPresets(sortedPresets);
+    safeWritePresets(sortedPresets);
+  };
+
+  const handleSaveAsPreset = () => {
+    const presetId = createPresetId();
+    const timestamp = Date.now();
+    const nextPreset = buildPreset(presetId, timestamp);
+    commitPresets([nextPreset, ...presets]);
+    setCurrentPresetId(presetId);
+    setPresetName(nextPreset.name);
+    showNotice({
+      message: "프리셋이 저장되었습니다",
+      detail: nextPreset.name,
+      tone: "info"
+    });
+  };
+
+  const handleUpdatePreset = () => {
+    if (!currentPresetId) {
+      handleSaveAsPreset();
+      return;
+    }
+
+    const currentPreset = presets.find((preset) => preset.id === currentPresetId);
+    const nextPreset = buildPreset(
+      currentPresetId,
+      currentPreset?.createdAt ?? Date.now()
+    );
+
+    commitPresets(
+      presets.map((preset) =>
+        preset.id === currentPresetId ? nextPreset : preset
+      )
+    );
+    setPresetName(nextPreset.name);
+    showNotice({
+      message: "프리셋이 업데이트되었습니다",
+      detail: nextPreset.name,
+      tone: "info"
+    });
+  };
+
+  const handleLoadPreset = (preset: ClockPreset) => {
+    applyLoadedSettings(
+      {
+        examTitle: preset.examTitle,
+        endTimeInput: preset.endTimeInput,
+        instructions: preset.instructions,
+        themeId: preset.themeId,
+        organizationName: preset.organizationName,
+        logoDataUrl: preset.logoDataUrl ?? null
+      },
+      { presetId: preset.id }
+    );
+    setPresetName(preset.name);
+    showNotice({
+      message: "프리셋을 불러왔습니다",
+      detail: "기존 진행 상태가 불러온 설정으로 변경되었습니다",
+      tone: "info"
+    });
+  };
+
+  const handleDeletePreset = (preset: ClockPreset) => {
+    if (!window.confirm(`'${preset.name}' 프리셋을 삭제할까요?`)) {
+      return;
+    }
+
+    const nextPresets = presets.filter((item) => item.id !== preset.id);
+    commitPresets(nextPresets);
+
+    if (currentPresetId === preset.id) {
+      setCurrentPresetId(null);
+    }
+
+    showNotice({
+      message: "프리셋이 삭제되었습니다",
+      detail: preset.name,
+      tone: "warning"
+    });
+  };
+
+  const pageClassName =
+    currentStatus === "ended"
+      ? "bg-[radial-gradient(circle_at_top,#5f0718_0%,#111827_44%,#030712_100%)] text-white"
+      : currentStatus === "paused"
+        ? "bg-[radial-gradient(circle_at_top,#854d0e_0%,#111827_44%,#030712_100%)] text-white"
+        : theme.pageClassName;
+
   return (
-    <main
-      className={`min-h-dvh overflow-hidden text-white ${
-        currentStatus === "ended"
-          ? "bg-[radial-gradient(circle_at_top,#5f0718_0%,#111827_44%,#030712_100%)]"
-          : currentStatus === "paused"
-            ? "bg-[radial-gradient(circle_at_top,#854d0e_0%,#111827_44%,#030712_100%)]"
-            : "bg-[radial-gradient(circle_at_top,#0f766e_0%,#111827_42%,#030712_100%)]"
-      }`}
-    >
+    <main className={`min-h-dvh overflow-hidden ${pageClassName}`}>
       <div className="flex min-h-dvh flex-col px-4 py-4 sm:px-6 lg:px-8">
         <header className="flex items-center justify-between gap-3">
-          <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.24em] text-teal-100/80">
-              Jogyo Clock
-            </p>
-            <p className="mt-1 text-xs text-slate-300">
-              clock.jogyo.web.app
-            </p>
-          </div>
+          <BrandMark
+            organizationName={organizationName}
+            logoDataUrl={logoDataUrl}
+            theme={theme}
+          />
 
           <div className="flex flex-wrap justify-end gap-2">
             <button
               type="button"
               aria-label={setupOpen ? "설정 패널 닫기" : "설정 패널 열기"}
-              className="rounded-md border border-white/15 bg-white/10 px-3 py-2 text-sm font-semibold text-white transition hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
+              className="rounded-md border border-current/15 bg-current/10 px-3 py-2 text-sm font-semibold transition hover:bg-current/15 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
               onClick={() => setSetupOpen((current) => !current)}
               disabled={isFullscreen}
             >
@@ -475,7 +767,7 @@ export default function ExamClockPage() {
             <button
               type="button"
               aria-label={isFullscreen ? "전체화면 해제" : "전체화면으로 보기"}
-              className="rounded-md border border-white/15 bg-white px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-teal-100 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:bg-slate-500 disabled:text-slate-200"
+              className={`rounded-md px-3 py-2 text-sm font-semibold transition focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-500 disabled:text-slate-200 ${theme.buttonClassName}`}
               onClick={handleToggleFullscreen}
               disabled={fullscreenStatus !== "supported"}
             >
@@ -486,14 +778,33 @@ export default function ExamClockPage() {
 
         <NoticeBanner notice={notice} />
 
-        <div className="grid flex-1 grid-cols-1 gap-4 py-4 lg:grid-cols-[minmax(320px,400px),1fr] lg:gap-6">
+        <div className="grid flex-1 grid-cols-1 gap-4 py-4 lg:grid-cols-[minmax(340px,430px),1fr] lg:gap-6">
           {setupOpen && !isFullscreen ? (
             <ExamSetupPanel
               settings={draftSettings}
               errorMessage={errorMessage}
               fullscreenStatus={fullscreenStatus}
               isFullscreen={isFullscreen}
+              theme={theme}
+              themeId={themeId}
+              organizationName={organizationName}
+              logoDataUrl={logoDataUrl}
+              presetName={presetName}
+              currentPresetId={currentPresetId}
+              presets={presets}
               onSettingsChange={setDraftSettings}
+              onThemeChange={setThemeId}
+              onOrganizationNameChange={setOrganizationName}
+              onLogoUpload={handleLogoUpload}
+              onLogoDelete={() => {
+                setLogoDataUrl(null);
+                showNotice({ message: "로고가 삭제되었습니다", tone: "warning" });
+              }}
+              onPresetNameChange={setPresetName}
+              onSaveAsPreset={handleSaveAsPreset}
+              onUpdatePreset={handleUpdatePreset}
+              onLoadPreset={handleLoadPreset}
+              onDeletePreset={handleDeletePreset}
               onSubmit={handleApplySettings}
               onToggleFullscreen={handleToggleFullscreen}
             />
@@ -502,10 +813,13 @@ export default function ExamClockPage() {
           <ClockDisplay
             examTitle={examTitle}
             instructions={instructions}
+            organizationName={organizationName}
+            logoDataUrl={logoDataUrl}
             nowMs={nowMs}
             endDateTime={endDateTime}
             remainingMs={remainingMs}
             status={currentStatus}
+            theme={theme}
             className={setupOpen && !isFullscreen ? "" : "lg:col-span-2"}
           />
         </div>
@@ -523,6 +837,41 @@ export default function ExamClockPage() {
         onToggleHelp={() => setShortcutHelpOpen((current) => !current)}
       />
     </main>
+  );
+}
+
+function BrandMark({
+  organizationName,
+  logoDataUrl,
+  theme
+}: {
+  organizationName: string;
+  logoDataUrl: string | null;
+  theme: ClockTheme;
+}) {
+  const displayName = organizationName.trim() || DEFAULT_ORGANIZATION_NAME;
+
+  return (
+    <div className="flex min-w-0 items-center gap-3">
+      {logoDataUrl ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={logoDataUrl}
+          alt={`${displayName} 로고`}
+          className="h-10 max-w-20 rounded-md object-contain sm:h-12 sm:max-w-28"
+        />
+      ) : null}
+      <div className="min-w-0">
+        <p
+          className={`truncate text-sm font-semibold uppercase tracking-[0.24em] ${theme.accentClassName}`}
+        >
+          {displayName}
+        </p>
+        <p className={`mt-1 text-xs ${theme.mutedTextClassName}`}>
+          clock.jogyo.web.app
+        </p>
+      </div>
+    </div>
   );
 }
 
@@ -560,7 +909,23 @@ function ExamSetupPanel({
   errorMessage,
   fullscreenStatus,
   isFullscreen,
+  theme,
+  themeId,
+  organizationName,
+  logoDataUrl,
+  presetName,
+  currentPresetId,
+  presets,
   onSettingsChange,
+  onThemeChange,
+  onOrganizationNameChange,
+  onLogoUpload,
+  onLogoDelete,
+  onPresetNameChange,
+  onSaveAsPreset,
+  onUpdatePreset,
+  onLoadPreset,
+  onDeletePreset,
   onSubmit,
   onToggleFullscreen
 }: {
@@ -568,7 +933,23 @@ function ExamSetupPanel({
   errorMessage: string;
   fullscreenStatus: FullscreenStatus;
   isFullscreen: boolean;
+  theme: ClockTheme;
+  themeId: ThemeId;
+  organizationName: string;
+  logoDataUrl: string | null;
+  presetName: string;
+  currentPresetId: string | null;
+  presets: ClockPreset[];
   onSettingsChange: (settings: ExamSettings) => void;
+  onThemeChange: (themeId: ThemeId) => void;
+  onOrganizationNameChange: (value: string) => void;
+  onLogoUpload: (event: ChangeEvent<HTMLInputElement>) => void;
+  onLogoDelete: () => void;
+  onPresetNameChange: (value: string) => void;
+  onSaveAsPreset: () => void;
+  onUpdatePreset: () => void;
+  onLoadPreset: (preset: ClockPreset) => void;
+  onDeletePreset: (preset: ClockPreset) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onToggleFullscreen: () => void;
 }) {
@@ -580,67 +961,173 @@ function ExamSetupPanel({
   };
 
   return (
-    <aside className="rounded-lg border border-white/10 bg-slate-950/70 p-4 shadow-2xl shadow-black/30 backdrop-blur sm:p-5">
-      <form className="flex h-full flex-col gap-4" onSubmit={onSubmit} noValidate>
-        <div>
-          <h1 className="text-xl font-bold text-white">시험 시계 설정</h1>
-          <p className="mt-1 text-sm text-slate-300">
-            종료 시각은 오늘 날짜 기준으로 계산됩니다.
-          </p>
-        </div>
+    <aside
+      className={`max-h-[calc(100dvh-7rem)] overflow-y-auto rounded-lg border p-4 shadow-2xl backdrop-blur sm:p-5 ${theme.panelClassName}`}
+    >
+      <form className="flex h-full flex-col gap-5" onSubmit={onSubmit} noValidate>
+        <section className="space-y-4">
+          <div>
+            <h1 className={`text-xl font-bold ${theme.primaryTextClassName}`}>
+              시험 정보
+            </h1>
+            <p className={`mt-1 text-sm ${theme.mutedTextClassName}`}>
+              종료 시각은 오늘 날짜 기준으로 계산됩니다.
+            </p>
+          </div>
 
-        <div className="space-y-2">
-          <label
-            htmlFor="exam-title"
-            className="block text-sm font-semibold text-slate-100"
-          >
-            시험 제목
-          </label>
-          <input
-            id="exam-title"
-            type="text"
-            value={settings.title}
-            onChange={(event) => updateField("title", event.target.value)}
-            className="w-full rounded-md border border-white/10 bg-white/10 px-3 py-3 text-base text-white outline-none transition placeholder:text-slate-500 focus:border-teal-200 focus:ring-2 focus:ring-teal-200/30"
-            placeholder="기말고사"
-          />
-        </div>
+          <Field label="시험 제목" htmlFor="exam-title" theme={theme}>
+            <input
+              id="exam-title"
+              type="text"
+              value={settings.title}
+              onChange={(event) => updateField("title", event.target.value)}
+              className={`w-full rounded-md border px-3 py-3 text-base outline-none transition focus:ring-2 ${theme.inputClassName}`}
+              placeholder="기말고사"
+            />
+          </Field>
 
-        <div className="space-y-2">
-          <label
-            htmlFor="exam-end-time"
-            className="block text-sm font-semibold text-slate-100"
-          >
-            종료 시각
-          </label>
-          <input
-            id="exam-end-time"
-            type="time"
-            value={settings.endTime}
-            onChange={(event) => updateField("endTime", event.target.value)}
-            className="w-full rounded-md border border-white/10 bg-white/10 px-3 py-3 font-mono text-base tabular-nums text-white outline-none transition focus:border-teal-200 focus:ring-2 focus:ring-teal-200/30"
-            required
-          />
-          {errorMessage ? (
-            <p className="text-sm font-medium text-red-200">{errorMessage}</p>
-          ) : null}
-        </div>
+          <Field label="종료 시각" htmlFor="exam-end-time" theme={theme}>
+            <input
+              id="exam-end-time"
+              type="time"
+              value={settings.endTime}
+              onChange={(event) => updateField("endTime", event.target.value)}
+              className={`w-full rounded-md border px-3 py-3 font-mono text-base tabular-nums outline-none transition focus:ring-2 ${theme.inputClassName}`}
+              required
+            />
+            {errorMessage ? (
+              <p className="mt-2 text-sm font-medium text-red-300">
+                {errorMessage}
+              </p>
+            ) : null}
+          </Field>
 
-        <div className="flex-1 space-y-2">
-          <label
-            htmlFor="exam-notice"
-            className="block text-sm font-semibold text-slate-100"
-          >
-            주의사항
-          </label>
-          <textarea
-            id="exam-notice"
-            value={settings.notice}
-            onChange={(event) => updateField("notice", event.target.value)}
-            className="min-h-36 w-full resize-y rounded-md border border-white/10 bg-white/10 px-3 py-3 text-base leading-7 text-white outline-none transition placeholder:text-slate-500 focus:border-teal-200 focus:ring-2 focus:ring-teal-200/30"
-            placeholder="시험 중 안내할 내용을 입력하세요"
+          <Field label="주의사항" htmlFor="exam-notice" theme={theme}>
+            <textarea
+              id="exam-notice"
+              value={settings.notice}
+              onChange={(event) => updateField("notice", event.target.value)}
+              className={`min-h-32 w-full resize-y rounded-md border px-3 py-3 text-base leading-7 outline-none transition focus:ring-2 ${theme.inputClassName}`}
+              placeholder="시험 중 안내할 내용을 입력하세요"
+            />
+          </Field>
+        </section>
+
+        <section className="space-y-4 border-t border-current/10 pt-4">
+          <h2 className={`text-lg font-bold ${theme.primaryTextClassName}`}>
+            브랜딩
+          </h2>
+
+          <Field label="소속명" htmlFor="organization-name" theme={theme}>
+            <input
+              id="organization-name"
+              type="text"
+              value={organizationName}
+              onChange={(event) => onOrganizationNameChange(event.target.value)}
+              className={`w-full rounded-md border px-3 py-3 text-base outline-none transition focus:ring-2 ${theme.inputClassName}`}
+              placeholder="Jogyo Clock"
+            />
+          </Field>
+
+          <Field label="테마" htmlFor="clock-theme" theme={theme}>
+            <select
+              id="clock-theme"
+              value={themeId}
+              onChange={(event) =>
+                onThemeChange(normalizeThemeId(event.target.value))
+              }
+              className={`w-full rounded-md border px-3 py-3 text-base outline-none transition focus:ring-2 ${theme.inputClassName}`}
+            >
+              {Object.values(CLOCK_THEMES).map((clockTheme) => (
+                <option key={clockTheme.id} value={clockTheme.id}>
+                  {clockTheme.name}
+                </option>
+              ))}
+            </select>
+            <p className={`mt-2 text-xs ${theme.mutedTextClassName}`}>
+              {CLOCK_THEMES[themeId].description}
+            </p>
+          </Field>
+
+          <Field label="로고" htmlFor="clock-logo" theme={theme}>
+            <input
+              id="clock-logo"
+              type="file"
+              accept="image/*"
+              onChange={onLogoUpload}
+              className={`w-full rounded-md border px-3 py-3 text-sm outline-none transition file:mr-3 file:rounded-md file:border-0 file:px-3 file:py-2 file:text-sm file:font-bold focus:ring-2 ${theme.inputClassName}`}
+            />
+            <div className="mt-3 flex items-center gap-3">
+              {logoDataUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={logoDataUrl}
+                  alt={`${
+                    organizationName.trim() || DEFAULT_ORGANIZATION_NAME
+                  } 로고`}
+                  className="h-12 max-w-24 rounded-md object-contain"
+                />
+              ) : (
+                <p className={`text-sm ${theme.mutedTextClassName}`}>
+                  선택된 로고가 없습니다
+                </p>
+              )}
+              <button
+                type="button"
+                aria-label="로고 삭제"
+                onClick={onLogoDelete}
+                disabled={!logoDataUrl}
+                className="rounded-md border border-current/15 px-3 py-2 text-sm font-bold transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                로고 삭제
+              </button>
+            </div>
+          </Field>
+        </section>
+
+        <section className="space-y-4 border-t border-current/10 pt-4">
+          <h2 className={`text-lg font-bold ${theme.primaryTextClassName}`}>
+            프리셋
+          </h2>
+
+          <Field label="프리셋 이름" htmlFor="preset-name" theme={theme}>
+            <input
+              id="preset-name"
+              type="text"
+              value={presetName}
+              onChange={(event) => onPresetNameChange(event.target.value)}
+              className={`w-full rounded-md border px-3 py-3 text-base outline-none transition focus:ring-2 ${theme.inputClassName}`}
+              placeholder={settings.title || "기말고사"}
+            />
+          </Field>
+
+          <div className="grid gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              aria-label="현재 설정을 새 프리셋으로 저장"
+              onClick={onSaveAsPreset}
+              className={`rounded-md px-4 py-3 text-sm font-black transition focus:outline-none focus:ring-2 ${theme.buttonClassName}`}
+            >
+              새 이름으로 저장
+            </button>
+            <button
+              type="button"
+              aria-label="현재 프리셋 업데이트"
+              onClick={onUpdatePreset}
+              className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200"
+            >
+              {currentPresetId ? "프리셋 업데이트" : "현재 설정 저장"}
+            </button>
+          </div>
+
+          <PresetList
+            presets={presets}
+            currentPresetId={currentPresetId}
+            theme={theme}
+            onLoadPreset={onLoadPreset}
+            onDeletePreset={onDeletePreset}
           />
-        </div>
+        </section>
 
         {fullscreenStatus === "unsupported" ? (
           <p className="rounded-md border border-yellow-300/20 bg-yellow-300/10 px-3 py-2 text-sm text-yellow-100">
@@ -648,11 +1135,11 @@ function ExamSetupPanel({
           </p>
         ) : null}
 
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
+        <section className="grid gap-2 border-t border-current/10 pt-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
           <button
             type="submit"
             aria-label="시계 시작"
-            className="rounded-md bg-teal-300 px-4 py-3 text-base font-bold text-slate-950 transition hover:bg-teal-200 focus:outline-none focus:ring-2 focus:ring-teal-100"
+            className={`rounded-md px-4 py-3 text-base font-bold transition focus:outline-none focus:ring-2 ${theme.buttonClassName}`}
           >
             시계 시작
           </button>
@@ -661,31 +1148,123 @@ function ExamSetupPanel({
             aria-label={isFullscreen ? "전체화면 해제" : "전체화면으로 보기"}
             onClick={onToggleFullscreen}
             disabled={fullscreenStatus !== "supported"}
-            className="rounded-md border border-white/15 bg-white/10 px-4 py-3 text-base font-bold text-white transition hover:bg-white/15 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
+            className="rounded-md border border-current/15 px-4 py-3 text-base font-bold transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
           >
             {isFullscreen ? "전체화면 해제" : "전체화면"}
           </button>
-        </div>
+        </section>
       </form>
     </aside>
+  );
+}
+
+function Field({
+  label,
+  htmlFor,
+  theme,
+  children
+}: {
+  label: string;
+  htmlFor: string;
+  theme: ClockTheme;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="space-y-2">
+      <label htmlFor={htmlFor} className={`block text-sm font-semibold ${theme.secondaryTextClassName}`}>
+        {label}
+      </label>
+      {children}
+    </div>
+  );
+}
+
+function PresetList({
+  presets,
+  currentPresetId,
+  theme,
+  onLoadPreset,
+  onDeletePreset
+}: {
+  presets: ClockPreset[];
+  currentPresetId: string | null;
+  theme: ClockTheme;
+  onLoadPreset: (preset: ClockPreset) => void;
+  onDeletePreset: (preset: ClockPreset) => void;
+}) {
+  if (presets.length === 0) {
+    return (
+      <p className={`rounded-md border border-current/10 px-3 py-4 text-center text-sm ${theme.mutedTextClassName}`}>
+        저장된 프리셋이 없습니다
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      {presets.map((preset) => (
+        <article
+          key={preset.id}
+          className={`rounded-md border p-3 ${
+            preset.id === currentPresetId
+              ? "border-teal-200/50 bg-teal-300/10"
+              : "border-current/10 bg-current/5"
+          }`}
+        >
+          <div className="min-w-0">
+            <p className={`truncate text-sm font-black ${theme.primaryTextClassName}`}>
+              {preset.name}
+            </p>
+            <p className={`mt-1 text-xs ${theme.mutedTextClassName}`}>
+              {preset.examTitle} · 종료 {preset.endTimeInput} · 수정{" "}
+              {formatUpdatedAt(preset.updatedAt)}
+            </p>
+          </div>
+          <div className="mt-3 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              aria-label={`${preset.name} 프리셋 불러오기`}
+              onClick={() => onLoadPreset(preset)}
+              className="rounded-md border border-current/15 px-3 py-2 text-sm font-bold transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200"
+            >
+              불러오기
+            </button>
+            <button
+              type="button"
+              aria-label={`${preset.name} 프리셋 삭제`}
+              onClick={() => onDeletePreset(preset)}
+              className="rounded-md border border-red-300/30 bg-red-500/10 px-3 py-2 text-sm font-bold text-red-100 transition hover:bg-red-500/20 focus:outline-none focus:ring-2 focus:ring-red-200"
+            >
+              삭제
+            </button>
+          </div>
+        </article>
+      ))}
+    </div>
   );
 }
 
 function ClockDisplay({
   examTitle,
   instructions,
+  organizationName,
+  logoDataUrl,
   nowMs,
   endDateTime,
   remainingMs,
   status,
+  theme,
   className = ""
 }: {
   examTitle: string;
   instructions: string;
+  organizationName: string;
+  logoDataUrl: string | null;
   nowMs: number | null;
   endDateTime: number | null;
   remainingMs: number;
-  status: "waiting" | "running" | "paused" | "ended";
+  status: ClockStatus;
+  theme: ClockTheme;
   className?: string;
 }) {
   const statusLabel =
@@ -699,21 +1278,38 @@ function ClockDisplay({
 
   return (
     <section
-      className={`flex min-h-[calc(100dvh-8.5rem)] flex-col rounded-lg border border-white/10 bg-black/25 px-4 py-6 shadow-2xl shadow-black/20 sm:px-6 lg:px-10 ${className}`}
+      className={`flex min-h-[calc(100dvh-8.5rem)] flex-col rounded-lg border px-4 py-6 shadow-2xl sm:px-6 lg:px-10 ${theme.clockPanelClassName} ${className}`}
     >
       <div className="text-center">
+        <div className="mb-4 flex items-center justify-center gap-3">
+          {logoDataUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={logoDataUrl}
+              alt={`${
+                organizationName.trim() || DEFAULT_ORGANIZATION_NAME
+              } 로고`}
+              className="h-10 max-w-24 rounded-md object-contain sm:h-14 sm:max-w-36"
+            />
+          ) : null}
+          <p
+            className={`truncate text-sm font-semibold uppercase tracking-[0.24em] sm:text-base ${theme.accentClassName}`}
+          >
+            {organizationName.trim() || DEFAULT_ORGANIZATION_NAME}
+          </p>
+        </div>
         <p
           className={`text-sm font-semibold uppercase tracking-[0.24em] ${
             status === "paused"
               ? "text-amber-200"
               : status === "ended"
                 ? "text-red-200"
-                : "text-slate-300"
+                : theme.mutedTextClassName
           }`}
         >
           {statusLabel}
         </p>
-        <h2 className="mt-3 break-keep text-3xl font-black text-white sm:text-5xl lg:text-6xl">
+        <h2 className={`mt-3 break-keep text-3xl font-black sm:text-5xl lg:text-6xl ${theme.primaryTextClassName}`}>
           {examTitle}
         </h2>
       </div>
@@ -741,7 +1337,7 @@ function ClockDisplay({
               ? "text-red-200"
               : status === "paused"
                 ? "text-amber-100"
-                : "text-teal-100"
+                : theme.accentClassName
           }`}
         >
           {nowMs ? formatDuration(remainingMs) : "--:--:--"}
@@ -753,16 +1349,20 @@ function ClockDisplay({
           <InfoRow
             label="현재 시각"
             value={nowMs ? formatClockTime(new Date(nowMs)) : "--:--:--"}
+            theme={theme}
           />
           <InfoRow
             label="종료 시각"
             value={endDateTime ? formatTimeOnly(new Date(endDateTime)) : "--:--"}
+            theme={theme}
           />
         </div>
 
         {instructions.trim() ? (
-          <div className="mx-auto max-w-5xl rounded-lg border border-white/10 bg-white/10 px-4 py-4 text-center text-lg font-semibold leading-8 text-slate-100 sm:text-2xl sm:leading-10">
-            <p className="whitespace-pre-line break-keep">{instructions}</p>
+          <div className="mx-auto max-w-5xl rounded-lg border border-current/10 bg-current/10 px-4 py-4 text-center text-lg font-semibold leading-8 sm:text-2xl sm:leading-10">
+            <p className={`whitespace-pre-line break-keep ${theme.secondaryTextClassName}`}>
+              {instructions}
+            </p>
           </div>
         ) : null}
       </div>
@@ -882,11 +1482,21 @@ function ControlButton({
   );
 }
 
-function InfoRow({ label, value }: { label: string; value: string }) {
+function InfoRow({
+  label,
+  value,
+  theme
+}: {
+  label: string;
+  value: string;
+  theme: ClockTheme;
+}) {
   return (
-    <div className="rounded-md border border-white/10 bg-slate-950/60 px-4 py-3 text-center">
-      <p className="text-sm font-semibold text-slate-300">{label}</p>
-      <p className="mt-1 font-mono text-2xl font-bold tabular-nums text-white sm:text-3xl">
+    <div className={`rounded-md border px-4 py-3 text-center ${theme.infoCardClassName}`}>
+      <p className={`text-sm font-semibold ${theme.mutedTextClassName}`}>
+        {label}
+      </p>
+      <p className={`mt-1 font-mono text-2xl font-bold tabular-nums sm:text-3xl ${theme.primaryTextClassName}`}>
         {value}
       </p>
     </div>
