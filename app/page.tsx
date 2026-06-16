@@ -13,6 +13,7 @@ import {
   signOut,
   type User,
 } from "firebase/auth";
+import { QRCodeSVG } from "qrcode.react";
 import {
   CLOCK_THEMES,
   normalizeThemeId,
@@ -35,6 +36,22 @@ import {
   saveLastSettingsToCloud,
   savePresetsToCloud,
 } from "./lib/cloudStorage";
+import {
+  createRoom,
+  deleteRoom,
+  listRooms,
+  updateRoom,
+  updateRoomCurrentShare,
+  type Room,
+} from "./lib/roomStorage";
+import {
+  createShareId,
+  createSharedClock,
+  stopSharedClock,
+  updateSharedClock,
+  type ShareStatus,
+  type SharedClock,
+} from "./lib/shareStorage";
 
 type ExamSettings = {
   title: string;
@@ -52,6 +69,8 @@ type CloudAction =
   | "savePresets"
   | "load"
   | null;
+type ShareAction = "create" | "update" | "stop" | "copy" | null;
+type RoomAction = "load" | "create" | "update" | "delete" | null;
 
 type Notice = {
   message: string;
@@ -209,6 +228,14 @@ function getShortErrorMessage(error: unknown) {
   return "잠시 후 다시 시도하세요";
 }
 
+function getPublicShareUrl(shareId: string) {
+  if (typeof window === "undefined") {
+    return `/share/${shareId}`;
+  }
+
+  return `${window.location.origin}/share/${shareId}`;
+}
+
 export default function ExamClockPage() {
   const [examTitle, setExamTitle] = useState("기말고사");
   const [instructions, setInstructions] = useState(DEFAULT_NOTICE);
@@ -246,6 +273,13 @@ export default function ExamClockPage() {
   const [authUser, setAuthUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [cloudAction, setCloudAction] = useState<CloudAction>(null);
+  const [rooms, setRooms] = useState<Room[]>([]);
+  const [selectedRoomId, setSelectedRoomId] = useState("");
+  const [roomNameInput, setRoomNameInput] = useState("");
+  const [roomAction, setRoomAction] = useState<RoomAction>(null);
+  const [activeSharedClock, setActiveSharedClock] =
+    useState<SharedClock | null>(null);
+  const [shareAction, setShareAction] = useState<ShareAction>(null);
 
   const theme = CLOCK_THEMES[themeId];
 
@@ -373,6 +407,56 @@ export default function ExamClockPage() {
       unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+      setRooms([]);
+      setSelectedRoomId("");
+      setRoomNameInput("");
+      setActiveSharedClock(null);
+      return;
+    }
+
+    let isMounted = true;
+    setRoomAction("load");
+
+    listRooms({
+      db: firebaseServices.db,
+      uid: authUser.uid,
+    })
+      .then((nextRooms) => {
+        if (!isMounted) {
+          return;
+        }
+
+        setRooms(nextRooms);
+        setSelectedRoomId((currentRoomId) =>
+          currentRoomId && nextRooms.some((room) => room.id === currentRoomId)
+            ? currentRoomId
+            : nextRooms[0]?.id ?? "",
+        );
+      })
+      .catch((error) => {
+        if (!isMounted) {
+          return;
+        }
+
+        showNotice({
+          message: "강의실 목록을 불러오지 못했습니다",
+          detail: getShortErrorMessage(error),
+          tone: "warning",
+        });
+      })
+      .finally(() => {
+        if (isMounted) {
+          setRoomAction(null);
+        }
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [authUser, firebaseServices, showNotice]);
 
   useEffect(() => {
     if (!hasLoadedSettings) {
@@ -814,6 +898,328 @@ export default function ExamClockPage() {
     });
   };
 
+  const getSelectedRoom = () =>
+    rooms.find((room) => room.id === selectedRoomId) ?? null;
+
+  const getShareStatus = (): ShareStatus => {
+    if (currentStatus === "paused") {
+      return "paused";
+    }
+
+    if (currentStatus === "ended") {
+      return "ended";
+    }
+
+    return "running";
+  };
+
+  const buildSharedClock = (shareId: string, createdAt: number): SharedClock => {
+    const selectedRoom = getSelectedRoom();
+    const timestamp = Date.now();
+
+    return {
+      id: shareId,
+      ownerUid: authUser?.uid ?? "",
+      roomId: selectedRoom?.id ?? null,
+      roomName: selectedRoom?.name ?? "",
+      examTitle: examTitle.trim() || "기말고사",
+      endDateTime: endDateTime ?? timestamp,
+      endTimeInput: draftSettings.endTime,
+      instructions,
+      themeId,
+      organizationName: organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
+      logoDataUrl: logoDataUrl || null,
+      isPaused,
+      pausedRemainingMs: isPaused ? remainingMs : null,
+      status: getShareStatus(),
+      isPublic: true,
+      createdAt,
+      updatedAt: timestamp,
+      expiresAt: null,
+    };
+  };
+
+  const handleCreateRoom = async () => {
+    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+      return;
+    }
+
+    const roomName = roomNameInput.trim();
+
+    if (!roomName) {
+      showNotice({
+        message: "강의실 이름을 입력하세요",
+        tone: "warning",
+      });
+      return;
+    }
+
+    setRoomAction("create");
+
+    try {
+      const room = await createRoom({
+        db: firebaseServices.db,
+        uid: authUser.uid,
+        name: roomName,
+      });
+      setRooms((currentRooms) => [room, ...currentRooms]);
+      setSelectedRoomId(room.id);
+      setRoomNameInput("");
+      showNotice({
+        message: "강의실이 생성되었습니다",
+        detail: room.name,
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "강의실 생성에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setRoomAction(null);
+    }
+  };
+
+  const handleRenameRoom = async () => {
+    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+      return;
+    }
+
+    const selectedRoom = getSelectedRoom();
+    const roomName = roomNameInput.trim();
+
+    if (!selectedRoom || !roomName) {
+      showNotice({
+        message: "수정할 강의실과 이름을 확인하세요",
+        tone: "warning",
+      });
+      return;
+    }
+
+    setRoomAction("update");
+
+    try {
+      const nextRoom = await updateRoom({
+        db: firebaseServices.db,
+        uid: authUser.uid,
+        room: {
+          ...selectedRoom,
+          name: roomName,
+        },
+      });
+      setRooms((currentRooms) =>
+        currentRooms
+          .map((room) => (room.id === nextRoom.id ? nextRoom : room))
+          .sort((a, b) => b.updatedAt - a.updatedAt),
+      );
+      setRoomNameInput("");
+      showNotice({
+        message: "강의실 이름이 수정되었습니다",
+        detail: nextRoom.name,
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "강의실 수정에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setRoomAction(null);
+    }
+  };
+
+  const handleDeleteRoom = async () => {
+    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+      return;
+    }
+
+    const selectedRoom = getSelectedRoom();
+
+    if (!selectedRoom) {
+      return;
+    }
+
+    if (!window.confirm(`'${selectedRoom.name}' 강의실을 삭제할까요?`)) {
+      return;
+    }
+
+    setRoomAction("delete");
+
+    try {
+      await deleteRoom({
+        db: firebaseServices.db,
+        uid: authUser.uid,
+        roomId: selectedRoom.id,
+      });
+      const nextRooms = rooms.filter((room) => room.id !== selectedRoom.id);
+      setRooms(nextRooms);
+      setSelectedRoomId(nextRooms[0]?.id ?? "");
+      setRoomNameInput("");
+      showNotice({
+        message: "강의실이 삭제되었습니다",
+        detail: selectedRoom.name,
+        tone: "warning",
+      });
+    } catch (error) {
+      showNotice({
+        message: "강의실 삭제에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setRoomAction(null);
+    }
+  };
+
+  const handleCreateShare = async () => {
+    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+      return;
+    }
+
+    const shareId = createShareId();
+    const timestamp = Date.now();
+    const sharedClock = buildSharedClock(shareId, timestamp);
+    setShareAction("create");
+
+    try {
+      await createSharedClock({
+        db: firebaseServices.db,
+        sharedClock,
+      });
+
+      if (sharedClock.roomId) {
+        await updateRoomCurrentShare({
+          db: firebaseServices.db,
+          uid: authUser.uid,
+          roomId: sharedClock.roomId,
+          shareId,
+        });
+      }
+
+      setActiveSharedClock(sharedClock);
+      setRooms((currentRooms) =>
+        currentRooms.map((room) =>
+          room.id === sharedClock.roomId
+            ? { ...room, currentShareId: shareId, updatedAt: Date.now() }
+            : room,
+        ),
+      );
+      showNotice({
+        message: "공유 링크가 생성되었습니다",
+        detail: getPublicShareUrl(shareId),
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "공유 링크 생성에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setShareAction(null);
+    }
+  };
+
+  const handleUpdateShare = async () => {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser ||
+      !activeSharedClock
+    ) {
+      return;
+    }
+
+    const sharedClock = buildSharedClock(
+      activeSharedClock.id,
+      activeSharedClock.createdAt,
+    );
+    setShareAction("update");
+
+    try {
+      await updateSharedClock({
+        db: firebaseServices.db,
+        sharedClock,
+      });
+      setActiveSharedClock(sharedClock);
+      showNotice({
+        message: "공유 시계가 업데이트되었습니다",
+        detail: `마지막 업데이트: ${formatClockTime(new Date(sharedClock.updatedAt))}`,
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "공유 시계 업데이트에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setShareAction(null);
+    }
+  };
+
+  const handleStopShare = async () => {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !activeSharedClock
+    ) {
+      return;
+    }
+
+    setShareAction("stop");
+
+    try {
+      await stopSharedClock({
+        db: firebaseServices.db,
+        shareId: activeSharedClock.id,
+      });
+      setActiveSharedClock({
+        ...activeSharedClock,
+        isPublic: false,
+        updatedAt: Date.now(),
+      });
+      showNotice({
+        message: "공유가 중지되었습니다",
+        tone: "warning",
+      });
+    } catch (error) {
+      showNotice({
+        message: "공유 중지에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setShareAction(null);
+    }
+  };
+
+  const handleCopyShareLink = async () => {
+    if (!activeSharedClock) {
+      return;
+    }
+
+    setShareAction("copy");
+
+    try {
+      await navigator.clipboard.writeText(getPublicShareUrl(activeSharedClock.id));
+      showNotice({
+        message: "공유 링크가 복사되었습니다",
+        tone: "info",
+      });
+    } catch {
+      showNotice({
+        message: "공유 링크 복사에 실패했습니다",
+        detail: "표시된 링크를 직접 복사하세요",
+        tone: "warning",
+      });
+    } finally {
+      setShareAction(null);
+    }
+  };
+
   const handleGoogleLogin = async () => {
     if (!firebaseServices || firebaseServices.status === "disabled") {
       showNotice({
@@ -1032,6 +1438,12 @@ export default function ExamClockPage() {
               authUser={authUser}
               authReady={authReady}
               cloudAction={cloudAction}
+              rooms={rooms}
+              selectedRoomId={selectedRoomId}
+              roomNameInput={roomNameInput}
+              roomAction={roomAction}
+              activeSharedClock={activeSharedClock}
+              shareAction={shareAction}
               onSettingsChange={setDraftSettings}
               onThemeChange={setThemeId}
               onOrganizationNameChange={setOrganizationName}
@@ -1053,6 +1465,15 @@ export default function ExamClockPage() {
               onSaveCurrentSettingsToCloud={handleSaveCurrentSettingsToCloud}
               onSavePresetsToCloud={handleSavePresetsToCloud}
               onLoadFromCloud={handleLoadFromCloud}
+              onSelectedRoomChange={setSelectedRoomId}
+              onRoomNameInputChange={setRoomNameInput}
+              onCreateRoom={handleCreateRoom}
+              onRenameRoom={handleRenameRoom}
+              onDeleteRoom={handleDeleteRoom}
+              onCreateShare={handleCreateShare}
+              onUpdateShare={handleUpdateShare}
+              onStopShare={handleStopShare}
+              onCopyShareLink={handleCopyShareLink}
               onSubmit={handleApplySettings}
               onToggleFullscreen={handleToggleFullscreen}
             />
@@ -1168,6 +1589,12 @@ function ExamSetupPanel({
   authUser,
   authReady,
   cloudAction,
+  rooms,
+  selectedRoomId,
+  roomNameInput,
+  roomAction,
+  activeSharedClock,
+  shareAction,
   onSettingsChange,
   onThemeChange,
   onOrganizationNameChange,
@@ -1183,6 +1610,15 @@ function ExamSetupPanel({
   onSaveCurrentSettingsToCloud,
   onSavePresetsToCloud,
   onLoadFromCloud,
+  onSelectedRoomChange,
+  onRoomNameInputChange,
+  onCreateRoom,
+  onRenameRoom,
+  onDeleteRoom,
+  onCreateShare,
+  onUpdateShare,
+  onStopShare,
+  onCopyShareLink,
   onSubmit,
   onToggleFullscreen,
 }: {
@@ -1201,6 +1637,12 @@ function ExamSetupPanel({
   authUser: User | null;
   authReady: boolean;
   cloudAction: CloudAction;
+  rooms: Room[];
+  selectedRoomId: string;
+  roomNameInput: string;
+  roomAction: RoomAction;
+  activeSharedClock: SharedClock | null;
+  shareAction: ShareAction;
   onSettingsChange: (settings: ExamSettings) => void;
   onThemeChange: (themeId: ThemeId) => void;
   onOrganizationNameChange: (value: string) => void;
@@ -1216,6 +1658,15 @@ function ExamSetupPanel({
   onSaveCurrentSettingsToCloud: () => void;
   onSavePresetsToCloud: () => void;
   onLoadFromCloud: () => void;
+  onSelectedRoomChange: (roomId: string) => void;
+  onRoomNameInputChange: (value: string) => void;
+  onCreateRoom: () => void;
+  onRenameRoom: () => void;
+  onDeleteRoom: () => void;
+  onCreateShare: () => void;
+  onUpdateShare: () => void;
+  onStopShare: () => void;
+  onCopyShareLink: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onToggleFullscreen: () => void;
 }) {
@@ -1411,6 +1862,34 @@ function ExamSetupPanel({
           onSaveCurrentSettingsToCloud={onSaveCurrentSettingsToCloud}
           onSavePresetsToCloud={onSavePresetsToCloud}
           onLoadFromCloud={onLoadFromCloud}
+        />
+
+        <RoomPanel
+          theme={theme}
+          firebaseServices={firebaseServices}
+          authUser={authUser}
+          rooms={rooms}
+          selectedRoomId={selectedRoomId}
+          roomNameInput={roomNameInput}
+          roomAction={roomAction}
+          onSelectedRoomChange={onSelectedRoomChange}
+          onRoomNameInputChange={onRoomNameInputChange}
+          onCreateRoom={onCreateRoom}
+          onRenameRoom={onRenameRoom}
+          onDeleteRoom={onDeleteRoom}
+        />
+
+        <SharePanel
+          theme={theme}
+          firebaseServices={firebaseServices}
+          authUser={authUser}
+          activeSharedClock={activeSharedClock}
+          selectedRoom={rooms.find((room) => room.id === selectedRoomId) ?? null}
+          shareAction={shareAction}
+          onCreateShare={onCreateShare}
+          onUpdateShare={onUpdateShare}
+          onStopShare={onStopShare}
+          onCopyShareLink={onCopyShareLink}
         />
 
         {fullscreenStatus === "unsupported" ? (
@@ -1657,6 +2136,228 @@ function CloudPanel({
             : "로컬 프리셋 클라우드에 저장"}
         </button>
       </div>
+    </section>
+  );
+}
+
+function RoomPanel({
+  theme,
+  firebaseServices,
+  authUser,
+  rooms,
+  selectedRoomId,
+  roomNameInput,
+  roomAction,
+  onSelectedRoomChange,
+  onRoomNameInputChange,
+  onCreateRoom,
+  onRenameRoom,
+  onDeleteRoom,
+}: {
+  theme: ClockTheme;
+  firebaseServices: FirebaseServices | null;
+  authUser: User | null;
+  rooms: Room[];
+  selectedRoomId: string;
+  roomNameInput: string;
+  roomAction: RoomAction;
+  onSelectedRoomChange: (roomId: string) => void;
+  onRoomNameInputChange: (value: string) => void;
+  onCreateRoom: () => void;
+  onRenameRoom: () => void;
+  onDeleteRoom: () => void;
+}) {
+  const firebaseDisabled =
+    firebaseServices === null || firebaseServices.status === "disabled";
+  const canManageRooms = !firebaseDisabled && Boolean(authUser) && !roomAction;
+  const selectedRoom = rooms.find((room) => room.id === selectedRoomId) ?? null;
+
+  return (
+    <section className="space-y-4 border-t border-current/10 pt-4">
+      <div>
+        <h2 className={`text-lg font-bold ${theme.primaryTextClassName}`}>
+          강의실 / 시험실
+        </h2>
+        <p className={`mt-1 text-sm ${theme.mutedTextClassName}`}>
+          {authUser
+            ? "공유 링크에 포함할 강의실을 선택하세요"
+            : "로그인하면 강의실별 공유 시계를 관리할 수 있습니다"}
+        </p>
+      </div>
+
+      <Field label="강의실 선택" htmlFor="room-select" theme={theme}>
+        <select
+          id="room-select"
+          value={selectedRoomId}
+          onChange={(event) => onSelectedRoomChange(event.target.value)}
+          disabled={!canManageRooms || rooms.length === 0}
+          className={`w-full rounded-md border px-3 py-3 text-base outline-none transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60 ${theme.inputClassName}`}
+        >
+          {rooms.length === 0 ? (
+            <option value="">저장된 강의실이 없습니다</option>
+          ) : null}
+          {rooms.map((room) => (
+            <option key={room.id} value={room.id}>
+              {room.name}
+            </option>
+          ))}
+        </select>
+      </Field>
+
+      <Field label="강의실 이름" htmlFor="room-name" theme={theme}>
+        <input
+          id="room-name"
+          type="text"
+          value={roomNameInput}
+          onChange={(event) => onRoomNameInputChange(event.target.value)}
+          disabled={!canManageRooms}
+          className={`w-full rounded-md border px-3 py-3 text-base outline-none transition focus:ring-2 disabled:cursor-not-allowed disabled:opacity-60 ${theme.inputClassName}`}
+          placeholder={selectedRoom?.name || "농심국제관 305호"}
+        />
+      </Field>
+
+      <div className="grid gap-2 sm:grid-cols-3">
+        <button
+          type="button"
+          aria-label="강의실 생성"
+          onClick={onCreateRoom}
+          disabled={!canManageRooms}
+          className={`rounded-md px-4 py-3 text-sm font-black transition focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50 ${theme.buttonClassName}`}
+        >
+          {roomAction === "create" ? "생성 중..." : "생성"}
+        </button>
+        <button
+          type="button"
+          aria-label="강의실 이름 수정"
+          onClick={onRenameRoom}
+          disabled={!canManageRooms || !selectedRoom}
+          className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {roomAction === "update" ? "수정 중..." : "수정"}
+        </button>
+        <button
+          type="button"
+          aria-label="강의실 삭제"
+          onClick={onDeleteRoom}
+          disabled={!canManageRooms || !selectedRoom}
+          className="rounded-md border border-red-300/30 bg-red-500/10 px-4 py-3 text-sm font-black text-red-100 transition hover:bg-red-500/20 focus:outline-none focus:ring-2 focus:ring-red-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {roomAction === "delete" ? "삭제 중..." : "삭제"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function SharePanel({
+  theme,
+  firebaseServices,
+  authUser,
+  activeSharedClock,
+  selectedRoom,
+  shareAction,
+  onCreateShare,
+  onUpdateShare,
+  onStopShare,
+  onCopyShareLink,
+}: {
+  theme: ClockTheme;
+  firebaseServices: FirebaseServices | null;
+  authUser: User | null;
+  activeSharedClock: SharedClock | null;
+  selectedRoom: Room | null;
+  shareAction: ShareAction;
+  onCreateShare: () => void;
+  onUpdateShare: () => void;
+  onStopShare: () => void;
+  onCopyShareLink: () => void;
+}) {
+  const firebaseDisabled =
+    firebaseServices === null || firebaseServices.status === "disabled";
+  const canShare = !firebaseDisabled && Boolean(authUser) && !shareAction;
+  const shareUrl = activeSharedClock ? getPublicShareUrl(activeSharedClock.id) : "";
+
+  return (
+    <section className="space-y-4 border-t border-current/10 pt-4">
+      <div>
+        <h2 className={`text-lg font-bold ${theme.primaryTextClassName}`}>
+          공유 링크 / QR
+        </h2>
+        <p className={`mt-1 text-sm ${theme.mutedTextClassName}`}>
+          학생 또는 보조 감독자가 이 링크를 열면 읽기 전용 시계를 볼 수 있습니다.
+        </p>
+      </div>
+
+      {selectedRoom ? (
+        <p className={`rounded-md border border-current/10 bg-current/5 px-3 py-2 text-sm ${theme.secondaryTextClassName}`}>
+          선택된 강의실: <span className="font-black">{selectedRoom.name}</span>
+        </p>
+      ) : null}
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <button
+          type="button"
+          aria-label="공유 링크 생성"
+          onClick={onCreateShare}
+          disabled={!canShare}
+          className={`rounded-md px-4 py-3 text-sm font-black transition focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50 ${theme.buttonClassName}`}
+        >
+          {shareAction === "create" ? "생성 중..." : "공유 링크 생성"}
+        </button>
+        <button
+          type="button"
+          aria-label="공유 시계 업데이트"
+          onClick={onUpdateShare}
+          disabled={!canShare || !activeSharedClock}
+          className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {shareAction === "update" ? "업데이트 중..." : "공유 시계 업데이트"}
+        </button>
+      </div>
+
+      {activeSharedClock ? (
+        <div className="space-y-3 rounded-md border border-current/10 bg-current/5 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className={`text-sm font-black ${theme.primaryTextClassName}`}>
+              {activeSharedClock.isPublic ? "공유 중" : "공유 중지됨"}
+            </p>
+            <p className={`text-xs ${theme.mutedTextClassName}`}>
+              마지막 업데이트 {formatClockTime(new Date(activeSharedClock.updatedAt))}
+            </p>
+          </div>
+          <input
+            readOnly
+            aria-label="공유 링크"
+            value={shareUrl}
+            className={`w-full rounded-md border px-3 py-2 text-sm outline-none ${theme.inputClassName}`}
+          />
+          {activeSharedClock.isPublic ? (
+            <div className="flex justify-center rounded-md bg-white p-3">
+              <QRCodeSVG value={shareUrl} size={180} />
+            </div>
+          ) : null}
+          <div className="grid gap-2 sm:grid-cols-2">
+            <button
+              type="button"
+              aria-label="공유 링크 복사"
+              onClick={onCopyShareLink}
+              disabled={!activeSharedClock || shareAction === "copy"}
+              className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {shareAction === "copy" ? "복사 중..." : "링크 복사"}
+            </button>
+            <button
+              type="button"
+              aria-label="공유 중지"
+              onClick={onStopShare}
+              disabled={!canShare || !activeSharedClock.isPublic}
+              className="rounded-md border border-red-300/30 bg-red-500/10 px-4 py-3 text-sm font-black text-red-100 transition hover:bg-red-500/20 focus:outline-none focus:ring-2 focus:ring-red-200 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {shareAction === "stop" ? "중지 중..." : "공유 중지"}
+            </button>
+          </div>
+        </div>
+      ) : null}
     </section>
   );
 }
