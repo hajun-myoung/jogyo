@@ -24,6 +24,15 @@ const FIREBASE_ENV_KEYS = [
   "NEXT_PUBLIC_FIREBASE_APP_ID",
 ] as const;
 
+const FIREBASE_ENV_KEY_TO_CONFIG_KEY = {
+  NEXT_PUBLIC_FIREBASE_API_KEY: "apiKey",
+  NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN: "authDomain",
+  NEXT_PUBLIC_FIREBASE_PROJECT_ID: "projectId",
+  NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET: "storageBucket",
+  NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID: "messagingSenderId",
+  NEXT_PUBLIC_FIREBASE_APP_ID: "appId",
+} as const;
+
 function readFirebaseConfig() {
   const envValues = {
     apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -33,8 +42,10 @@ function readFirebaseConfig() {
     messagingSenderId: process.env.NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID,
     appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
   };
-  console.log(envValues);
-  const missingKeys = FIREBASE_ENV_KEYS.filter((key) => !process.env[key]);
+  const missingKeys = FIREBASE_ENV_KEYS.filter((key) => {
+    const configKey = FIREBASE_ENV_KEY_TO_CONFIG_KEY[key];
+    return !envValues[configKey];
+  });
 
   if (missingKeys.length > 0) {
     return {
