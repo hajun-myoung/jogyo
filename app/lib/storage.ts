@@ -36,19 +36,19 @@ function canUseStorage() {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-function normalizeText(value: unknown, fallback = "") {
+export function normalizeText(value: unknown, fallback = "") {
   return typeof value === "string" ? value : fallback;
 }
 
-function normalizeTimestamp(value: unknown) {
+export function normalizeTimestamp(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
 }
 
-function normalizePreset(value: unknown): ClockPreset | null {
+export function normalizePreset(value: unknown): ClockPreset | null {
   if (!isRecord(value)) {
     return null;
   }
@@ -75,6 +75,23 @@ function normalizePreset(value: unknown): ClockPreset | null {
     createdAt: normalizeTimestamp(value.createdAt),
     updatedAt: normalizeTimestamp(value.updatedAt)
   };
+}
+
+export function mergePresets(
+  localPresets: ClockPreset[],
+  cloudPresets: ClockPreset[]
+) {
+  const presetMap = new Map<string, ClockPreset>();
+
+  [...localPresets, ...cloudPresets].forEach((preset) => {
+    const currentPreset = presetMap.get(preset.id);
+
+    if (!currentPreset || preset.updatedAt > currentPreset.updatedAt) {
+      presetMap.set(preset.id, preset);
+    }
+  });
+
+  return Array.from(presetMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export function safeReadPresets(): ClockPreset[] {

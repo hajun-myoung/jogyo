@@ -1,21 +1,40 @@
 "use client";
 
-import { ChangeEvent, FormEvent, useCallback, useEffect, useState } from "react";
+import {
+  ChangeEvent,
+  FormEvent,
+  useCallback,
+  useEffect,
+  useState,
+} from "react";
+import {
+  onAuthStateChanged,
+  signInWithPopup,
+  signOut,
+  type User,
+} from "firebase/auth";
 import {
   CLOCK_THEMES,
   normalizeThemeId,
   type ClockTheme,
-  type ThemeId
+  type ThemeId,
 } from "./lib/themes";
 import {
   createPresetId,
+  mergePresets,
   safeReadLastSettings,
   safeReadPresets,
   safeWriteLastSettings,
   safeWritePresets,
   type ClockPreset,
-  type LastSettings
+  type LastSettings,
 } from "./lib/storage";
+import { getFirebaseServices, type FirebaseServices } from "./lib/firebase";
+import {
+  loadCloudData,
+  saveLastSettingsToCloud,
+  savePresetsToCloud,
+} from "./lib/cloudStorage";
 
 type ExamSettings = {
   title: string;
@@ -26,6 +45,13 @@ type ExamSettings = {
 type FullscreenStatus = "checking" | "supported" | "unsupported";
 type NoticeTone = "info" | "warning" | "danger";
 type ClockStatus = "waiting" | "running" | "paused" | "ended";
+type CloudAction =
+  | "login"
+  | "logout"
+  | "saveSettings"
+  | "savePresets"
+  | "load"
+  | null;
 
 type Notice = {
   message: string;
@@ -36,7 +62,7 @@ type Notice = {
 const DEFAULT_NOTICE = [
   "휴대전화 사용 금지",
   "답안지 이름과 학번을 확인하세요",
-  "종료 후 감독 안내에 따라 제출하세요"
+  "종료 후 감독 안내에 따라 제출하세요",
 ].join("\n");
 
 const DEFAULT_ORGANIZATION_NAME = "Jogyo Clock";
@@ -51,7 +77,7 @@ function padTime(value: number) {
 
 function formatClockTime(date: Date) {
   return `${padTime(date.getHours())}:${padTime(date.getMinutes())}:${padTime(
-    date.getSeconds()
+    date.getSeconds(),
   )}`;
 }
 
@@ -83,7 +109,7 @@ function formatCompactDuration(totalMilliseconds: number) {
 function formatUpdatedAt(timestamp: number) {
   const date = new Date(timestamp);
   return `${padTime(date.getMonth() + 1)}/${padTime(date.getDate())} ${padTime(
-    date.getHours()
+    date.getHours(),
   )}:${padTime(date.getMinutes())}`;
 }
 
@@ -93,7 +119,7 @@ function createDefaultSettings(nowMs = Date.now()): ExamSettings {
   return {
     title: "기말고사",
     endTime: formatTimeOnly(defaultEnd),
-    notice: DEFAULT_NOTICE
+    notice: DEFAULT_NOTICE,
   };
 }
 
@@ -128,7 +154,7 @@ function getRemainingMs({
   endDateTime,
   nowMs,
   isPaused,
-  pausedRemainingMs
+  pausedRemainingMs,
 }: {
   endDateTime: number | null;
   nowMs: number | null;
@@ -158,7 +184,7 @@ function getLastSettingsFromDraft({
   draftSettings,
   themeId,
   organizationName,
-  logoDataUrl
+  logoDataUrl,
 }: {
   draftSettings: ExamSettings;
   themeId: ThemeId;
@@ -171,8 +197,16 @@ function getLastSettingsFromDraft({
     instructions: draftSettings.notice,
     themeId,
     organizationName: organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
-    logoDataUrl
+    logoDataUrl,
   };
+}
+
+function getShortErrorMessage(error: unknown) {
+  if (error instanceof Error && error.message) {
+    return error.message.slice(0, 120);
+  }
+
+  return "잠시 후 다시 시도하세요";
 }
 
 export default function ExamClockPage() {
@@ -182,11 +216,11 @@ export default function ExamClockPage() {
   const [draftSettings, setDraftSettings] = useState<ExamSettings>({
     title: "기말고사",
     endTime: "",
-    notice: DEFAULT_NOTICE
+    notice: DEFAULT_NOTICE,
   });
   const [themeId, setThemeId] = useState<ThemeId>("defaultDark");
   const [organizationName, setOrganizationName] = useState(
-    DEFAULT_ORGANIZATION_NAME
+    DEFAULT_ORGANIZATION_NAME,
   );
   const [logoDataUrl, setLogoDataUrl] = useState<string | null>(null);
   const [presets, setPresets] = useState<ClockPreset[]>([]);
@@ -198,13 +232,20 @@ export default function ExamClockPage() {
   const [isStarted, setIsStarted] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [pausedAt, setPausedAt] = useState<number | null>(null);
-  const [pausedRemainingMs, setPausedRemainingMs] = useState<number | null>(null);
+  const [pausedRemainingMs, setPausedRemainingMs] = useState<number | null>(
+    null,
+  );
   const [notice, setNotice] = useState<Notice | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [fullscreenStatus, setFullscreenStatus] =
     useState<FullscreenStatus>("checking");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+  const [firebaseServices, setFirebaseServices] =
+    useState<FirebaseServices | null>(null);
+  const [authUser, setAuthUser] = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [cloudAction, setCloudAction] = useState<CloudAction>(null);
 
   const theme = CLOCK_THEMES[themeId];
 
@@ -218,7 +259,7 @@ export default function ExamClockPage() {
     if (nextEndDateTime !== null) {
       setDraftSettings((current) => ({
         ...current,
-        endTime: formatTimeOnly(new Date(nextEndDateTime))
+        endTime: formatTimeOnly(new Date(nextEndDateTime)),
       }));
     }
   }, []);
@@ -229,15 +270,17 @@ export default function ExamClockPage() {
       const fallbackSettings = createDefaultSettings(currentNowMs);
       const parsedEndDateTime = parseTodayEndDateTime(
         settings.endTimeInput,
-        currentNowMs
+        currentNowMs,
       );
       const nextEndDateTime =
         parsedEndDateTime ??
         parseTodayEndDateTime(fallbackSettings.endTime, currentNowMs);
       const nextDraftSettings = {
         title: settings.examTitle.trim() || "기말고사",
-        endTime: parsedEndDateTime ? settings.endTimeInput : fallbackSettings.endTime,
-        notice: settings.instructions
+        endTime: parsedEndDateTime
+          ? settings.endTimeInput
+          : fallbackSettings.endTime,
+        notice: settings.instructions,
       };
 
       setExamTitle(nextDraftSettings.title);
@@ -246,7 +289,7 @@ export default function ExamClockPage() {
       setPresetName(nextDraftSettings.title);
       setThemeId(normalizeThemeId(settings.themeId));
       setOrganizationName(
-        settings.organizationName.trim() || DEFAULT_ORGANIZATION_NAME
+        settings.organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
       );
       setLogoDataUrl(settings.logoDataUrl || null);
       setCurrentPresetId(options?.presetId ?? null);
@@ -260,11 +303,11 @@ export default function ExamClockPage() {
         showNotice({
           message: "종료 시각을 기본값으로 대체했습니다",
           detail: "불러온 설정의 종료 시각 형식이 올바르지 않습니다",
-          tone: "warning"
+          tone: "warning",
         });
       }
     },
-    [showNotice]
+    [showNotice],
   );
 
   useEffect(() => {
@@ -277,7 +320,7 @@ export default function ExamClockPage() {
       instructions: defaultSettings.notice,
       themeId: "defaultDark",
       organizationName: DEFAULT_ORGANIZATION_NAME,
-      logoDataUrl: null
+      logoDataUrl: null,
     };
     const initialEndDateTime =
       parseTodayEndDateTime(initialSettings.endTimeInput, initialNow) ??
@@ -292,11 +335,11 @@ export default function ExamClockPage() {
       endTime: parseTodayEndDateTime(initialSettings.endTimeInput, initialNow)
         ? initialSettings.endTimeInput
         : defaultSettings.endTime,
-      notice: initialSettings.instructions
+      notice: initialSettings.instructions,
     });
     setThemeId(normalizeThemeId(initialSettings.themeId));
     setOrganizationName(
-      initialSettings.organizationName.trim() || DEFAULT_ORGANIZATION_NAME
+      initialSettings.organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
     );
     setLogoDataUrl(initialSettings.logoDataUrl || null);
     setPresetName(initialSettings.examTitle || "기말고사");
@@ -313,6 +356,25 @@ export default function ExamClockPage() {
   }, []);
 
   useEffect(() => {
+    const services = getFirebaseServices();
+    setFirebaseServices(services);
+
+    if (services.status === "disabled") {
+      setAuthReady(true);
+      return;
+    }
+
+    const unsubscribe = onAuthStateChanged(services.auth, (user) => {
+      setAuthUser(user);
+      setAuthReady(true);
+    });
+
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
     if (!hasLoadedSettings) {
       return;
     }
@@ -323,15 +385,21 @@ export default function ExamClockPage() {
           draftSettings,
           themeId,
           organizationName,
-          logoDataUrl
-        })
+          logoDataUrl,
+        }),
       );
     }, LAST_SETTINGS_DEBOUNCE_MS);
 
     return () => {
       window.clearTimeout(timeout);
     };
-  }, [draftSettings, hasLoadedSettings, logoDataUrl, organizationName, themeId]);
+  }, [
+    draftSettings,
+    hasLoadedSettings,
+    logoDataUrl,
+    organizationName,
+    themeId,
+  ]);
 
   useEffect(() => {
     if (!notice) {
@@ -349,7 +417,7 @@ export default function ExamClockPage() {
 
   useEffect(() => {
     const fullscreenEnabled = Boolean(
-      document.fullscreenEnabled && document.documentElement.requestFullscreen
+      document.fullscreenEnabled && document.documentElement.requestFullscreen,
     );
 
     setFullscreenStatus(fullscreenEnabled ? "supported" : "unsupported");
@@ -375,13 +443,10 @@ export default function ExamClockPage() {
     endDateTime,
     nowMs,
     isPaused,
-    pausedRemainingMs
+    pausedRemainingMs,
   });
   const isEnded = Boolean(
-    !isPaused &&
-      nowMs !== null &&
-      endDateTime !== null &&
-      endDateTime <= nowMs
+    !isPaused && nowMs !== null && endDateTime !== null && endDateTime <= nowMs,
   );
   const currentStatus: ClockStatus = isPaused
     ? "paused"
@@ -398,14 +463,14 @@ export default function ExamClockPage() {
       const endedNow =
         !isPaused && endDateTime !== null && endDateTime <= currentNowMs;
       const baseEndDateTime =
-        endedNow && minutes > 0 ? currentNowMs : endDateTime ?? currentNowMs;
+        endedNow && minutes > 0 ? currentNowMs : (endDateTime ?? currentNowMs);
       const nextEndDateTime = baseEndDateTime + deltaMs;
 
       applyEndDateTime(nextEndDateTime);
 
       if (isPaused) {
         setPausedRemainingMs((currentPausedRemainingMs) =>
-          Math.max(0, (currentPausedRemainingMs ?? remainingMs) + deltaMs)
+          Math.max(0, (currentPausedRemainingMs ?? remainingMs) + deltaMs),
         );
       }
 
@@ -416,10 +481,10 @@ export default function ExamClockPage() {
             ? `+${minutes}분 연장되었습니다`
             : `${minutes}분 단축되었습니다`,
         detail: `종료 시각: ${formatTimeOnly(new Date(nextEndDateTime))}`,
-        tone: minutes > 0 ? "info" : "warning"
+        tone: minutes > 0 ? "info" : "warning",
       });
     },
-    [applyEndDateTime, endDateTime, isPaused, remainingMs, showNotice]
+    [applyEndDateTime, endDateTime, isPaused, remainingMs, showNotice],
   );
 
   const togglePause = useCallback(() => {
@@ -430,7 +495,7 @@ export default function ExamClockPage() {
         endDateTime,
         nowMs: currentNowMs,
         isPaused: false,
-        pausedRemainingMs: null
+        pausedRemainingMs: null,
       });
 
       setIsPaused(true);
@@ -440,7 +505,7 @@ export default function ExamClockPage() {
       showNotice({
         message: "시험이 일시정지되었습니다",
         detail: `남은 시간: ${formatDuration(nextPausedRemainingMs)}`,
-        tone: "warning"
+        tone: "warning",
       });
       return;
     }
@@ -459,9 +524,9 @@ export default function ExamClockPage() {
     showNotice({
       message: "시험이 재개되었습니다",
       detail: `정지된 ${formatCompactDuration(
-        pausedElapsedMs
+        pausedElapsedMs,
       )}만큼 종료 시각이 연장되었습니다`,
-      tone: "info"
+      tone: "info",
     });
   }, [
     applyEndDateTime,
@@ -469,7 +534,7 @@ export default function ExamClockPage() {
     isPaused,
     pausedAt,
     pausedRemainingMs,
-    showNotice
+    showNotice,
   ]);
 
   const endExamNow = useCallback(() => {
@@ -482,7 +547,7 @@ export default function ExamClockPage() {
     showNotice({
       message: "시험이 종료되었습니다",
       detail: "답안을 제출해주세요",
-      tone: "danger"
+      tone: "danger",
     });
   }, [applyEndDateTime, showNotice]);
 
@@ -501,7 +566,7 @@ export default function ExamClockPage() {
       showNotice({
         message: "전체화면 전환을 완료하지 못했습니다",
         detail: "브라우저 권한이나 실행 환경을 확인하세요",
-        tone: "warning"
+        tone: "warning",
       });
     }
   }, [fullscreenStatus, showNotice]);
@@ -561,7 +626,7 @@ export default function ExamClockPage() {
 
     const nextEndDateTime = parseTodayEndDateTime(
       draftSettings.endTime,
-      currentNowMs
+      currentNowMs,
     );
 
     if (nextEndDateTime === null) {
@@ -582,7 +647,7 @@ export default function ExamClockPage() {
     showNotice({
       message: "시험 시계가 적용되었습니다",
       detail: `종료 시각: ${formatTimeOnly(new Date(nextEndDateTime))}`,
-      tone: nextEndDateTime <= currentNowMs ? "danger" : "info"
+      tone: nextEndDateTime <= currentNowMs ? "danger" : "info",
     });
   };
 
@@ -597,7 +662,7 @@ export default function ExamClockPage() {
     if (file.size > LOGO_MAX_BYTES) {
       showNotice({
         message: "로고 파일은 1MB 이하만 사용할 수 있습니다",
-        tone: "warning"
+        tone: "warning",
       });
       return;
     }
@@ -609,21 +674,21 @@ export default function ExamClockPage() {
         setLogoDataUrl(reader.result);
         showNotice({
           message: "로고가 적용되었습니다",
-          tone: "info"
+          tone: "info",
         });
         return;
       }
 
       showNotice({
         message: "로고 파일을 읽지 못했습니다",
-        tone: "warning"
+        tone: "warning",
       });
     };
 
     reader.onerror = () => {
       showNotice({
         message: "로고 파일을 읽지 못했습니다",
-        tone: "warning"
+        tone: "warning",
       });
     };
 
@@ -635,7 +700,7 @@ export default function ExamClockPage() {
       draftSettings,
       themeId,
       organizationName,
-      logoDataUrl
+      logoDataUrl,
     });
     const timestamp = Date.now();
 
@@ -649,15 +714,25 @@ export default function ExamClockPage() {
       organizationName: savedSettings.organizationName,
       logoDataUrl: savedSettings.logoDataUrl,
       createdAt,
-      updatedAt: timestamp
+      updatedAt: timestamp,
     };
   };
 
   const commitPresets = (nextPresets: ClockPreset[]) => {
-    const sortedPresets = [...nextPresets].sort((a, b) => b.updatedAt - a.updatedAt);
+    const sortedPresets = [...nextPresets].sort(
+      (a, b) => b.updatedAt - a.updatedAt,
+    );
     setPresets(sortedPresets);
     safeWritePresets(sortedPresets);
   };
+
+  const getCurrentLastSettings = () =>
+    getLastSettingsFromDraft({
+      draftSettings,
+      themeId,
+      organizationName,
+      logoDataUrl,
+    });
 
   const handleSaveAsPreset = () => {
     const presetId = createPresetId();
@@ -669,7 +744,7 @@ export default function ExamClockPage() {
     showNotice({
       message: "프리셋이 저장되었습니다",
       detail: nextPreset.name,
-      tone: "info"
+      tone: "info",
     });
   };
 
@@ -679,22 +754,24 @@ export default function ExamClockPage() {
       return;
     }
 
-    const currentPreset = presets.find((preset) => preset.id === currentPresetId);
+    const currentPreset = presets.find(
+      (preset) => preset.id === currentPresetId,
+    );
     const nextPreset = buildPreset(
       currentPresetId,
-      currentPreset?.createdAt ?? Date.now()
+      currentPreset?.createdAt ?? Date.now(),
     );
 
     commitPresets(
       presets.map((preset) =>
-        preset.id === currentPresetId ? nextPreset : preset
-      )
+        preset.id === currentPresetId ? nextPreset : preset,
+      ),
     );
     setPresetName(nextPreset.name);
     showNotice({
       message: "프리셋이 업데이트되었습니다",
       detail: nextPreset.name,
-      tone: "info"
+      tone: "info",
     });
   };
 
@@ -706,15 +783,15 @@ export default function ExamClockPage() {
         instructions: preset.instructions,
         themeId: preset.themeId,
         organizationName: preset.organizationName,
-        logoDataUrl: preset.logoDataUrl ?? null
+        logoDataUrl: preset.logoDataUrl ?? null,
       },
-      { presetId: preset.id }
+      { presetId: preset.id },
     );
     setPresetName(preset.name);
     showNotice({
       message: "프리셋을 불러왔습니다",
       detail: "기존 진행 상태가 불러온 설정으로 변경되었습니다",
-      tone: "info"
+      tone: "info",
     });
   };
 
@@ -733,8 +810,167 @@ export default function ExamClockPage() {
     showNotice({
       message: "프리셋이 삭제되었습니다",
       detail: preset.name,
-      tone: "warning"
+      tone: "warning",
     });
+  };
+
+  const handleGoogleLogin = async () => {
+    if (!firebaseServices || firebaseServices.status === "disabled") {
+      showNotice({
+        message: "Firebase 환경변수가 설정되지 않았습니다",
+        detail: "로컬 모드는 계속 사용할 수 있습니다",
+        tone: "warning",
+      });
+      return;
+    }
+
+    setCloudAction("login");
+
+    try {
+      await signInWithPopup(firebaseServices.auth, firebaseServices.provider);
+      showNotice({
+        message: "로그인되었습니다",
+        detail: "클라우드 저장과 불러오기를 사용할 수 있습니다",
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "로그인에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setCloudAction(null);
+    }
+  };
+
+  const handleLogout = async () => {
+    if (!firebaseServices || firebaseServices.status === "disabled") {
+      return;
+    }
+
+    setCloudAction("logout");
+
+    try {
+      await signOut(firebaseServices.auth);
+      showNotice({
+        message: "로그아웃되었습니다",
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "로그아웃에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setCloudAction(null);
+    }
+  };
+
+  const handleSaveCurrentSettingsToCloud = async () => {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
+      return;
+    }
+
+    setCloudAction("saveSettings");
+
+    try {
+      await saveLastSettingsToCloud({
+        db: firebaseServices.db,
+        uid: authUser.uid,
+        settings: getCurrentLastSettings(),
+      });
+      showNotice({
+        message: "클라우드에 저장되었습니다",
+        detail: "현재 설정을 저장했습니다",
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "클라우드 저장에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setCloudAction(null);
+    }
+  };
+
+  const handleSavePresetsToCloud = async () => {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
+      return;
+    }
+
+    setCloudAction("savePresets");
+
+    try {
+      await savePresetsToCloud({
+        db: firebaseServices.db,
+        uid: authUser.uid,
+        presets,
+      });
+      showNotice({
+        message: "클라우드에 저장되었습니다",
+        detail: "로컬 프리셋을 저장했습니다",
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "클라우드 저장에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setCloudAction(null);
+    }
+  };
+
+  const handleLoadFromCloud = async () => {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
+      return;
+    }
+
+    setCloudAction("load");
+
+    try {
+      const cloudData = await loadCloudData({
+        db: firebaseServices.db,
+        uid: authUser.uid,
+      });
+      const mergedPresets = mergePresets(presets, cloudData.presets);
+
+      if (cloudData.lastSettings) {
+        applyLoadedSettings(cloudData.lastSettings);
+      }
+
+      commitPresets(mergedPresets);
+      showNotice({
+        message: "클라우드 설정을 불러왔습니다",
+        detail: `${cloudData.presets.length}개 프리셋을 병합했습니다`,
+        tone: "info",
+      });
+    } catch (error) {
+      showNotice({
+        message: "클라우드 불러오기에 실패했습니다",
+        detail: getShortErrorMessage(error),
+        tone: "warning",
+      });
+    } finally {
+      setCloudAction(null);
+    }
   };
 
   const pageClassName =
@@ -792,19 +1028,31 @@ export default function ExamClockPage() {
               presetName={presetName}
               currentPresetId={currentPresetId}
               presets={presets}
+              firebaseServices={firebaseServices}
+              authUser={authUser}
+              authReady={authReady}
+              cloudAction={cloudAction}
               onSettingsChange={setDraftSettings}
               onThemeChange={setThemeId}
               onOrganizationNameChange={setOrganizationName}
               onLogoUpload={handleLogoUpload}
               onLogoDelete={() => {
                 setLogoDataUrl(null);
-                showNotice({ message: "로고가 삭제되었습니다", tone: "warning" });
+                showNotice({
+                  message: "로고가 삭제되었습니다",
+                  tone: "warning",
+                });
               }}
               onPresetNameChange={setPresetName}
               onSaveAsPreset={handleSaveAsPreset}
               onUpdatePreset={handleUpdatePreset}
               onLoadPreset={handleLoadPreset}
               onDeletePreset={handleDeletePreset}
+              onGoogleLogin={handleGoogleLogin}
+              onLogout={handleLogout}
+              onSaveCurrentSettingsToCloud={handleSaveCurrentSettingsToCloud}
+              onSavePresetsToCloud={handleSavePresetsToCloud}
+              onLoadFromCloud={handleLoadFromCloud}
               onSubmit={handleApplySettings}
               onToggleFullscreen={handleToggleFullscreen}
             />
@@ -843,7 +1091,7 @@ export default function ExamClockPage() {
 function BrandMark({
   organizationName,
   logoDataUrl,
-  theme
+  theme,
 }: {
   organizationName: string;
   logoDataUrl: string | null;
@@ -916,6 +1164,10 @@ function ExamSetupPanel({
   presetName,
   currentPresetId,
   presets,
+  firebaseServices,
+  authUser,
+  authReady,
+  cloudAction,
   onSettingsChange,
   onThemeChange,
   onOrganizationNameChange,
@@ -926,8 +1178,13 @@ function ExamSetupPanel({
   onUpdatePreset,
   onLoadPreset,
   onDeletePreset,
+  onGoogleLogin,
+  onLogout,
+  onSaveCurrentSettingsToCloud,
+  onSavePresetsToCloud,
+  onLoadFromCloud,
   onSubmit,
-  onToggleFullscreen
+  onToggleFullscreen,
 }: {
   settings: ExamSettings;
   errorMessage: string;
@@ -940,6 +1197,10 @@ function ExamSetupPanel({
   presetName: string;
   currentPresetId: string | null;
   presets: ClockPreset[];
+  firebaseServices: FirebaseServices | null;
+  authUser: User | null;
+  authReady: boolean;
+  cloudAction: CloudAction;
   onSettingsChange: (settings: ExamSettings) => void;
   onThemeChange: (themeId: ThemeId) => void;
   onOrganizationNameChange: (value: string) => void;
@@ -950,13 +1211,18 @@ function ExamSetupPanel({
   onUpdatePreset: () => void;
   onLoadPreset: (preset: ClockPreset) => void;
   onDeletePreset: (preset: ClockPreset) => void;
+  onGoogleLogin: () => void;
+  onLogout: () => void;
+  onSaveCurrentSettingsToCloud: () => void;
+  onSavePresetsToCloud: () => void;
+  onLoadFromCloud: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onToggleFullscreen: () => void;
 }) {
   const updateField = (field: keyof ExamSettings, value: string) => {
     onSettingsChange({
       ...settings,
-      [field]: value
+      [field]: value,
     });
   };
 
@@ -964,7 +1230,11 @@ function ExamSetupPanel({
     <aside
       className={`max-h-[calc(100dvh-7rem)] overflow-y-auto rounded-lg border p-4 shadow-2xl backdrop-blur sm:p-5 ${theme.panelClassName}`}
     >
-      <form className="flex h-full flex-col gap-5" onSubmit={onSubmit} noValidate>
+      <form
+        className="flex h-full flex-col gap-5"
+        onSubmit={onSubmit}
+        noValidate
+      >
         <section className="space-y-4">
           <div>
             <h1 className={`text-xl font-bold ${theme.primaryTextClassName}`}>
@@ -1129,6 +1399,20 @@ function ExamSetupPanel({
           />
         </section>
 
+        <CloudPanel
+          theme={theme}
+          firebaseServices={firebaseServices}
+          authUser={authUser}
+          authReady={authReady}
+          cloudAction={cloudAction}
+          presetCount={presets.length}
+          onGoogleLogin={onGoogleLogin}
+          onLogout={onLogout}
+          onSaveCurrentSettingsToCloud={onSaveCurrentSettingsToCloud}
+          onSavePresetsToCloud={onSavePresetsToCloud}
+          onLoadFromCloud={onLoadFromCloud}
+        />
+
         {fullscreenStatus === "unsupported" ? (
           <p className="rounded-md border border-yellow-300/20 bg-yellow-300/10 px-3 py-2 text-sm text-yellow-100">
             현재 브라우저는 전체화면 기능을 지원하지 않습니다.
@@ -1162,7 +1446,7 @@ function Field({
   label,
   htmlFor,
   theme,
-  children
+  children,
 }: {
   label: string;
   htmlFor: string;
@@ -1171,7 +1455,10 @@ function Field({
 }) {
   return (
     <div className="space-y-2">
-      <label htmlFor={htmlFor} className={`block text-sm font-semibold ${theme.secondaryTextClassName}`}>
+      <label
+        htmlFor={htmlFor}
+        className={`block text-sm font-semibold ${theme.secondaryTextClassName}`}
+      >
         {label}
       </label>
       {children}
@@ -1184,7 +1471,7 @@ function PresetList({
   currentPresetId,
   theme,
   onLoadPreset,
-  onDeletePreset
+  onDeletePreset,
 }: {
   presets: ClockPreset[];
   currentPresetId: string | null;
@@ -1194,7 +1481,9 @@ function PresetList({
 }) {
   if (presets.length === 0) {
     return (
-      <p className={`rounded-md border border-current/10 px-3 py-4 text-center text-sm ${theme.mutedTextClassName}`}>
+      <p
+        className={`rounded-md border border-current/10 px-3 py-4 text-center text-sm ${theme.mutedTextClassName}`}
+      >
         저장된 프리셋이 없습니다
       </p>
     );
@@ -1212,7 +1501,9 @@ function PresetList({
           }`}
         >
           <div className="min-w-0">
-            <p className={`truncate text-sm font-black ${theme.primaryTextClassName}`}>
+            <p
+              className={`truncate text-sm font-black ${theme.primaryTextClassName}`}
+            >
               {preset.name}
             </p>
             <p className={`mt-1 text-xs ${theme.mutedTextClassName}`}>
@@ -1244,6 +1535,132 @@ function PresetList({
   );
 }
 
+function CloudPanel({
+  theme,
+  firebaseServices,
+  authUser,
+  authReady,
+  cloudAction,
+  presetCount,
+  onGoogleLogin,
+  onLogout,
+  onSaveCurrentSettingsToCloud,
+  onSavePresetsToCloud,
+  onLoadFromCloud,
+}: {
+  theme: ClockTheme;
+  firebaseServices: FirebaseServices | null;
+  authUser: User | null;
+  authReady: boolean;
+  cloudAction: CloudAction;
+  presetCount: number;
+  onGoogleLogin: () => void;
+  onLogout: () => void;
+  onSaveCurrentSettingsToCloud: () => void;
+  onSavePresetsToCloud: () => void;
+  onLoadFromCloud: () => void;
+}) {
+  const firebaseDisabled =
+    firebaseServices === null || firebaseServices.status === "disabled";
+  const isBusy = cloudAction !== null;
+  const canUseCloud =
+    authReady && !firebaseDisabled && Boolean(authUser) && !isBusy;
+  const userLabel =
+    authUser?.displayName || authUser?.email || "로그인한 사용자";
+  const statusText = firebaseDisabled
+    ? "Firebase 환경변수가 설정되지 않았습니다"
+    : authUser
+      ? "클라우드 동기화 가능"
+      : "로그인하면 프리셋을 클라우드에 저장할 수 있습니다";
+
+  return (
+    <section className="space-y-4 border-t border-current/10 pt-4">
+      <div>
+        <h2 className={`text-lg font-bold ${theme.primaryTextClassName}`}>
+          클라우드
+        </h2>
+        <p className={`mt-1 text-sm ${theme.mutedTextClassName}`}>
+          {statusText}
+        </p>
+        {firebaseServices?.status === "disabled" ? (
+          <p className="mt-2 rounded-md border border-yellow-300/20 bg-yellow-300/10 px-3 py-2 text-xs text-yellow-100">
+            누락된 환경변수: {firebaseServices.missingKeys.join(", ")}
+          </p>
+        ) : null}
+      </div>
+
+      {authUser ? (
+        <div className="rounded-md border border-current/10 bg-current/5 px-3 py-3">
+          <p className={`text-xs ${theme.mutedTextClassName}`}>현재 사용자</p>
+          <p
+            className={`mt-1 truncate text-sm font-black ${theme.primaryTextClassName}`}
+          >
+            {userLabel}
+          </p>
+        </div>
+      ) : null}
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        {authUser ? (
+          <button
+            type="button"
+            aria-label="로그아웃"
+            onClick={onLogout}
+            disabled={firebaseDisabled || isBusy}
+            className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {cloudAction === "logout" ? "로그아웃 중..." : "로그아웃"}
+          </button>
+        ) : (
+          <button
+            type="button"
+            aria-label="Google 로그인"
+            onClick={onGoogleLogin}
+            disabled={firebaseDisabled || !authReady || isBusy}
+            className={`rounded-md px-4 py-3 text-sm font-black transition focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:opacity-50 ${theme.buttonClassName}`}
+          >
+            {cloudAction === "login" ? "로그인 중..." : "Google 로그인"}
+          </button>
+        )}
+        <button
+          type="button"
+          aria-label="클라우드에서 불러오기"
+          onClick={onLoadFromCloud}
+          disabled={!canUseCloud}
+          className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {cloudAction === "load" ? "불러오는 중..." : "클라우드에서 불러오기"}
+        </button>
+      </div>
+
+      <div className="grid gap-2 sm:grid-cols-2">
+        <button
+          type="button"
+          aria-label="현재 설정 클라우드 저장"
+          onClick={onSaveCurrentSettingsToCloud}
+          disabled={!canUseCloud}
+          className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {cloudAction === "saveSettings"
+            ? "저장 중..."
+            : "현재 설정 클라우드 저장"}
+        </button>
+        <button
+          type="button"
+          aria-label="로컬 프리셋 클라우드에 저장"
+          onClick={onSavePresetsToCloud}
+          disabled={!canUseCloud || presetCount === 0}
+          className="rounded-md border border-current/15 px-4 py-3 text-sm font-black transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {cloudAction === "savePresets"
+            ? "저장 중..."
+            : "로컬 프리셋 클라우드에 저장"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function ClockDisplay({
   examTitle,
   instructions,
@@ -1254,7 +1671,7 @@ function ClockDisplay({
   remainingMs,
   status,
   theme,
-  className = ""
+  className = "",
 }: {
   examTitle: string;
   instructions: string;
@@ -1309,7 +1726,9 @@ function ClockDisplay({
         >
           {statusLabel}
         </p>
-        <h2 className={`mt-3 break-keep text-3xl font-black sm:text-5xl lg:text-6xl ${theme.primaryTextClassName}`}>
+        <h2
+          className={`mt-3 break-keep text-3xl font-black sm:text-5xl lg:text-6xl ${theme.primaryTextClassName}`}
+        >
           {examTitle}
         </h2>
       </div>
@@ -1353,14 +1772,18 @@ function ClockDisplay({
           />
           <InfoRow
             label="종료 시각"
-            value={endDateTime ? formatTimeOnly(new Date(endDateTime)) : "--:--"}
+            value={
+              endDateTime ? formatTimeOnly(new Date(endDateTime)) : "--:--"
+            }
             theme={theme}
           />
         </div>
 
         {instructions.trim() ? (
           <div className="mx-auto max-w-5xl rounded-lg border border-current/10 bg-current/10 px-4 py-4 text-center text-lg font-semibold leading-8 sm:text-2xl sm:leading-10">
-            <p className={`whitespace-pre-line break-keep ${theme.secondaryTextClassName}`}>
+            <p
+              className={`whitespace-pre-line break-keep ${theme.secondaryTextClassName}`}
+            >
               {instructions}
             </p>
           </div>
@@ -1379,7 +1802,7 @@ function SupervisorControls({
   onTogglePause,
   onEndNow,
   onToggleFullscreen,
-  onToggleHelp
+  onToggleHelp,
 }: {
   isPaused: boolean;
   fullscreenStatus: FullscreenStatus;
@@ -1408,10 +1831,26 @@ function SupervisorControls({
       </div>
 
       <div className="grid grid-cols-4 gap-2">
-        <ControlButton label="+1분" ariaLabel="시험 시간 1분 연장" onClick={() => onAdjust(1)} />
-        <ControlButton label="+5분" ariaLabel="시험 시간 5분 연장" onClick={() => onAdjust(5)} />
-        <ControlButton label="-1분" ariaLabel="시험 시간 1분 단축" onClick={() => onAdjust(-1)} />
-        <ControlButton label="-5분" ariaLabel="시험 시간 5분 단축" onClick={() => onAdjust(-5)} />
+        <ControlButton
+          label="+1분"
+          ariaLabel="시험 시간 1분 연장"
+          onClick={() => onAdjust(1)}
+        />
+        <ControlButton
+          label="+5분"
+          ariaLabel="시험 시간 5분 연장"
+          onClick={() => onAdjust(5)}
+        />
+        <ControlButton
+          label="-1분"
+          ariaLabel="시험 시간 1분 단축"
+          onClick={() => onAdjust(-1)}
+        />
+        <ControlButton
+          label="-5분"
+          ariaLabel="시험 시간 5분 단축"
+          onClick={() => onAdjust(-5)}
+        />
       </div>
 
       <div className="mt-2 grid grid-cols-3 gap-2">
@@ -1452,7 +1891,7 @@ function ControlButton({
   ariaLabel,
   onClick,
   tone = "default",
-  disabled = false
+  disabled = false,
 }: {
   label: string;
   ariaLabel: string;
@@ -1485,18 +1924,22 @@ function ControlButton({
 function InfoRow({
   label,
   value,
-  theme
+  theme,
 }: {
   label: string;
   value: string;
   theme: ClockTheme;
 }) {
   return (
-    <div className={`rounded-md border px-4 py-3 text-center ${theme.infoCardClassName}`}>
+    <div
+      className={`rounded-md border px-4 py-3 text-center ${theme.infoCardClassName}`}
+    >
       <p className={`text-sm font-semibold ${theme.mutedTextClassName}`}>
         {label}
       </p>
-      <p className={`mt-1 font-mono text-2xl font-bold tabular-nums sm:text-3xl ${theme.primaryTextClassName}`}>
+      <p
+        className={`mt-1 font-mono text-2xl font-bold tabular-nums sm:text-3xl ${theme.primaryTextClassName}`}
+      >
         {value}
       </p>
     </div>
