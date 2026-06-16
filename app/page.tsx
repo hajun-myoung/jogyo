@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState } from "react";
 
 type ExamSettings = {
   title: string;
@@ -9,6 +9,13 @@ type ExamSettings = {
 };
 
 type FullscreenStatus = "checking" | "supported" | "unsupported";
+type NoticeTone = "info" | "warning" | "danger";
+
+type Notice = {
+  message: string;
+  detail?: string;
+  tone?: NoticeTone;
+};
 
 const DEFAULT_NOTICE = [
   "휴대전화 사용 금지",
@@ -16,28 +23,21 @@ const DEFAULT_NOTICE = [
   "종료 후 감독 안내에 따라 제출하세요"
 ].join("\n");
 
+const MINUTE_MS = 60 * 1000;
+const NOTICE_TIMEOUT_MS = 4000;
+
 function padTime(value: number) {
   return value.toString().padStart(2, "0");
-}
-
-function toTimeInputValue(date: Date) {
-  return `${padTime(date.getHours())}:${padTime(date.getMinutes())}`;
-}
-
-function createDefaultSettings(now = new Date()): ExamSettings {
-  const defaultEnd = new Date(now.getTime() + 90 * 60 * 1000);
-
-  return {
-    title: "기말고사",
-    endTime: toTimeInputValue(defaultEnd),
-    notice: DEFAULT_NOTICE
-  };
 }
 
 function formatClockTime(date: Date) {
   return `${padTime(date.getHours())}:${padTime(date.getMinutes())}:${padTime(
     date.getSeconds()
   )}`;
+}
+
+function formatTimeOnly(date: Date) {
+  return `${padTime(date.getHours())}:${padTime(date.getMinutes())}`;
 }
 
 function formatDuration(totalMilliseconds: number) {
@@ -49,7 +49,29 @@ function formatDuration(totalMilliseconds: number) {
   return `${padTime(hours)}:${padTime(minutes)}:${padTime(seconds)}`;
 }
 
-function getTodayEndDate(endTime: string, now: Date) {
+function formatCompactDuration(totalMilliseconds: number) {
+  const totalSeconds = Math.max(0, Math.floor(totalMilliseconds / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes > 0) {
+    return `${minutes}분 ${padTime(seconds)}초`;
+  }
+
+  return `${seconds}초`;
+}
+
+function createDefaultSettings(nowMs = Date.now()): ExamSettings {
+  const defaultEnd = new Date(nowMs + 90 * MINUTE_MS);
+
+  return {
+    title: "기말고사",
+    endTime: formatTimeOnly(defaultEnd),
+    notice: DEFAULT_NOTICE
+  };
+}
+
+function parseTodayEndDateTime(endTime: string, nowMs: number) {
   const timeParts = endTime.split(":");
 
   if (timeParts.length !== 2) {
@@ -71,49 +93,83 @@ function getTodayEndDate(endTime: string, now: Date) {
     return null;
   }
 
-  const endDate = new Date(now);
+  const endDate = new Date(nowMs);
   endDate.setHours(hours, minutes, 0, 0);
-  return endDate;
+  return endDate.getTime();
 }
 
-function getRemainingMilliseconds(endTime: string, now: Date) {
-  const endDate = getTodayEndDate(endTime, now);
+function getRemainingMs({
+  endDateTime,
+  nowMs,
+  isPaused,
+  pausedRemainingMs
+}: {
+  endDateTime: number | null;
+  nowMs: number | null;
+  isPaused: boolean;
+  pausedRemainingMs: number | null;
+}) {
+  if (isPaused && pausedRemainingMs !== null) {
+    return Math.max(0, pausedRemainingMs);
+  }
 
-  if (!endDate) {
+  if (endDateTime === null || nowMs === null) {
     return 0;
   }
 
-  return Math.max(0, endDate.getTime() - now.getTime());
+  return Math.max(0, endDateTime - nowMs);
+}
+
+function isFormField(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName);
 }
 
 export default function ExamClockPage() {
-  const [settings, setSettings] = useState<ExamSettings>({
-    title: "기말고사",
-    endTime: "",
-    notice: DEFAULT_NOTICE
-  });
+  const [examTitle, setExamTitle] = useState("기말고사");
+  const [instructions, setInstructions] = useState(DEFAULT_NOTICE);
+  const [endDateTime, setEndDateTime] = useState<number | null>(null);
   const [draftSettings, setDraftSettings] = useState<ExamSettings>({
     title: "기말고사",
     endTime: "",
     notice: DEFAULT_NOTICE
   });
-  const [now, setNow] = useState<Date | null>(null);
+  const [nowMs, setNowMs] = useState<number | null>(null);
   const [setupOpen, setSetupOpen] = useState(true);
-  const [hasStarted, setHasStarted] = useState(false);
+  const [isStarted, setIsStarted] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+  const [pausedAt, setPausedAt] = useState<number | null>(null);
+  const [pausedRemainingMs, setPausedRemainingMs] = useState<number | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [errorMessage, setErrorMessage] = useState("");
   const [fullscreenStatus, setFullscreenStatus] =
     useState<FullscreenStatus>("checking");
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
+
+  const showNotice = useCallback((nextNotice: Notice) => {
+    setNotice(nextNotice);
+  }, []);
 
   useEffect(() => {
-    const initialNow = new Date();
+    const initialNow = Date.now();
     const initialSettings = createDefaultSettings(initialNow);
-    setNow(initialNow);
-    setSettings(initialSettings);
+    const initialEndDateTime = parseTodayEndDateTime(
+      initialSettings.endTime,
+      initialNow
+    );
+
+    setNowMs(initialNow);
+    setExamTitle(initialSettings.title);
+    setInstructions(initialSettings.notice);
+    setEndDateTime(initialEndDateTime);
     setDraftSettings(initialSettings);
 
     const tick = window.setInterval(() => {
-      setNow(new Date());
+      setNowMs(Date.now());
     }, 1000);
 
     return () => {
@@ -122,9 +178,23 @@ export default function ExamClockPage() {
   }, []);
 
   useEffect(() => {
-    const fullscreenEnabled =
-      typeof document !== "undefined" &&
-      Boolean(document.fullscreenEnabled && document.documentElement.requestFullscreen);
+    if (!notice) {
+      return;
+    }
+
+    const timeout = window.setTimeout(() => {
+      setNotice(null);
+    }, NOTICE_TIMEOUT_MS);
+
+    return () => {
+      window.clearTimeout(timeout);
+    };
+  }, [notice]);
+
+  useEffect(() => {
+    const fullscreenEnabled = Boolean(
+      document.fullscreenEnabled && document.documentElement.requestFullscreen
+    );
 
     setFullscreenStatus(fullscreenEnabled ? "supported" : "unsupported");
 
@@ -145,32 +215,133 @@ export default function ExamClockPage() {
     };
   }, []);
 
-  const endDate = now ? getTodayEndDate(settings.endTime, now) : null;
-  const remainingMilliseconds = now
-    ? getRemainingMilliseconds(settings.endTime, now)
-    : 0;
-  const isEnded = Boolean(now && (!endDate || endDate.getTime() <= now.getTime()));
+  const remainingMs = getRemainingMs({
+    endDateTime,
+    nowMs,
+    isPaused,
+    pausedRemainingMs
+  });
+  const isEnded = Boolean(
+    !isPaused &&
+      nowMs !== null &&
+      endDateTime !== null &&
+      endDateTime <= nowMs
+  );
+  const currentStatus = isPaused
+    ? "paused"
+    : isEnded
+      ? "ended"
+      : isStarted
+        ? "running"
+        : "waiting";
 
-  const handleApplySettings = (event?: FormEvent<HTMLFormElement>) => {
-    event?.preventDefault();
+  const applyEndDateTime = useCallback((nextEndDateTime: number | null) => {
+    setEndDateTime(nextEndDateTime);
 
-    if (!draftSettings.endTime) {
-      setErrorMessage("종료 시각을 입력하세요.");
-      setSetupOpen(true);
+    if (nextEndDateTime !== null) {
+      setDraftSettings((current) => ({
+        ...current,
+        endTime: formatTimeOnly(new Date(nextEndDateTime))
+      }));
+    }
+  }, []);
+
+  const addMinutesToEnd = useCallback(
+    (minutes: number) => {
+      const currentNowMs = Date.now();
+      const deltaMs = minutes * MINUTE_MS;
+      const endedNow =
+        !isPaused && endDateTime !== null && endDateTime <= currentNowMs;
+      const baseEndDateTime =
+        endedNow && minutes > 0 ? currentNowMs : endDateTime ?? currentNowMs;
+      const nextEndDateTime = baseEndDateTime + deltaMs;
+
+      applyEndDateTime(nextEndDateTime);
+
+      if (isPaused) {
+        setPausedRemainingMs((currentPausedRemainingMs) =>
+          Math.max(0, (currentPausedRemainingMs ?? remainingMs) + deltaMs)
+        );
+      }
+
+      setIsStarted(true);
+      showNotice({
+        message:
+          minutes > 0
+            ? `+${minutes}분 연장되었습니다`
+            : `${minutes}분 단축되었습니다`,
+        detail: `종료 시각: ${formatTimeOnly(new Date(nextEndDateTime))}`,
+        tone: minutes > 0 ? "info" : "warning"
+      });
+    },
+    [applyEndDateTime, endDateTime, isPaused, remainingMs, showNotice]
+  );
+
+  const togglePause = useCallback(() => {
+    const currentNowMs = Date.now();
+
+    if (!isPaused) {
+      const nextPausedRemainingMs = getRemainingMs({
+        endDateTime,
+        nowMs: currentNowMs,
+        isPaused: false,
+        pausedRemainingMs: null
+      });
+
+      setIsPaused(true);
+      setPausedAt(currentNowMs);
+      setPausedRemainingMs(nextPausedRemainingMs);
+      setIsStarted(true);
+      showNotice({
+        message: "시험이 일시정지되었습니다",
+        detail: `남은 시간: ${formatDuration(nextPausedRemainingMs)}`,
+        tone: "warning"
+      });
       return;
     }
 
-    setSettings({
-      title: draftSettings.title.trim() || "기말고사",
-      endTime: draftSettings.endTime,
-      notice: draftSettings.notice
-    });
-    setErrorMessage("");
-    setHasStarted(true);
-    setSetupOpen(false);
-  };
+    const pausedElapsedMs = pausedAt ? currentNowMs - pausedAt : 0;
+    const nextEndDateTime =
+      endDateTime !== null
+        ? endDateTime + pausedElapsedMs
+        : currentNowMs + (pausedRemainingMs ?? 0);
 
-  const handleToggleFullscreen = async () => {
+    applyEndDateTime(nextEndDateTime);
+    setIsPaused(false);
+    setPausedAt(null);
+    setPausedRemainingMs(null);
+    setIsStarted(true);
+    showNotice({
+      message: "시험이 재개되었습니다",
+      detail: `정지된 ${formatCompactDuration(
+        pausedElapsedMs
+      )}만큼 종료 시각이 연장되었습니다`,
+      tone: "info"
+    });
+  }, [
+    applyEndDateTime,
+    endDateTime,
+    isPaused,
+    pausedAt,
+    pausedRemainingMs,
+    showNotice
+  ]);
+
+  const endExamNow = useCallback(() => {
+    const currentNowMs = Date.now();
+    applyEndDateTime(currentNowMs);
+    setIsPaused(false);
+    setPausedAt(null);
+    setPausedRemainingMs(null);
+    setIsStarted(true);
+    showNotice({
+      message: "시험이 종료되었습니다",
+      detail: "답안을 제출해주세요",
+      tone: "danger"
+    });
+  }, [applyEndDateTime, showNotice]);
+
+  const handleToggleFullscreen = useCallback(async () => {
     if (fullscreenStatus !== "supported") {
       return;
     }
@@ -182,16 +353,102 @@ export default function ExamClockPage() {
         await document.documentElement.requestFullscreen();
       }
     } catch {
-      setErrorMessage("브라우저에서 전체화면 전환을 완료하지 못했습니다.");
+      showNotice({
+        message: "전체화면 전환을 완료하지 못했습니다",
+        detail: "브라우저 권한이나 실행 환경을 확인하세요",
+        tone: "warning"
+      });
     }
+  }, [fullscreenStatus, showNotice]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isFormField(event.target)) {
+        return;
+      }
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        togglePause();
+        return;
+      }
+
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        addMinutesToEnd(event.shiftKey ? 5 : 1);
+        return;
+      }
+
+      if (event.key === "-" || event.key === "_") {
+        event.preventDefault();
+        addMinutesToEnd(event.shiftKey || event.key === "_" ? -5 : -1);
+        return;
+      }
+
+      if (event.key.toLowerCase() === "e") {
+        event.preventDefault();
+        endExamNow();
+        return;
+      }
+
+      if (event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        void handleToggleFullscreen();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [addMinutesToEnd, endExamNow, handleToggleFullscreen, togglePause]);
+
+  const handleApplySettings = (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    const currentNowMs = Date.now();
+
+    if (!draftSettings.endTime) {
+      setErrorMessage("종료 시각을 입력하세요.");
+      setSetupOpen(true);
+      return;
+    }
+
+    const nextEndDateTime = parseTodayEndDateTime(
+      draftSettings.endTime,
+      currentNowMs
+    );
+
+    if (nextEndDateTime === null) {
+      setErrorMessage("올바른 종료 시각을 입력하세요.");
+      setSetupOpen(true);
+      return;
+    }
+
+    setExamTitle(draftSettings.title.trim() || "기말고사");
+    setInstructions(draftSettings.notice);
+    applyEndDateTime(nextEndDateTime);
+    setErrorMessage("");
+    setIsStarted(true);
+    setIsPaused(false);
+    setPausedAt(null);
+    setPausedRemainingMs(null);
+    setSetupOpen(false);
+    showNotice({
+      message: "시험 시계가 적용되었습니다",
+      detail: `종료 시각: ${formatTimeOnly(new Date(nextEndDateTime))}`,
+      tone: nextEndDateTime <= currentNowMs ? "danger" : "info"
+    });
   };
 
   return (
     <main
       className={`min-h-dvh overflow-hidden text-white ${
-        isEnded
-          ? "bg-[radial-gradient(circle_at_top,#4c0519_0%,#111827_46%,#030712_100%)]"
-          : "bg-[radial-gradient(circle_at_top,#0f766e_0%,#111827_42%,#030712_100%)]"
+        currentStatus === "ended"
+          ? "bg-[radial-gradient(circle_at_top,#5f0718_0%,#111827_44%,#030712_100%)]"
+          : currentStatus === "paused"
+            ? "bg-[radial-gradient(circle_at_top,#854d0e_0%,#111827_44%,#030712_100%)]"
+            : "bg-[radial-gradient(circle_at_top,#0f766e_0%,#111827_42%,#030712_100%)]"
       }`}
     >
       <div className="flex min-h-dvh flex-col px-4 py-4 sm:px-6 lg:px-8">
@@ -227,6 +484,8 @@ export default function ExamClockPage() {
           </div>
         </header>
 
+        <NoticeBanner notice={notice} />
+
         <div className="grid flex-1 grid-cols-1 gap-4 py-4 lg:grid-cols-[minmax(320px,400px),1fr] lg:gap-6">
           {setupOpen && !isFullscreen ? (
             <ExamSetupPanel
@@ -241,16 +500,58 @@ export default function ExamClockPage() {
           ) : null}
 
           <ClockDisplay
-            settings={settings}
-            now={now}
-            remainingMilliseconds={remainingMilliseconds}
-            isEnded={isEnded}
-            hasStarted={hasStarted}
+            examTitle={examTitle}
+            instructions={instructions}
+            nowMs={nowMs}
+            endDateTime={endDateTime}
+            remainingMs={remainingMs}
+            status={currentStatus}
             className={setupOpen && !isFullscreen ? "" : "lg:col-span-2"}
           />
         </div>
       </div>
+
+      <SupervisorControls
+        isPaused={isPaused}
+        fullscreenStatus={fullscreenStatus}
+        isFullscreen={isFullscreen}
+        shortcutHelpOpen={shortcutHelpOpen}
+        onAdjust={addMinutesToEnd}
+        onTogglePause={togglePause}
+        onEndNow={endExamNow}
+        onToggleFullscreen={handleToggleFullscreen}
+        onToggleHelp={() => setShortcutHelpOpen((current) => !current)}
+      />
     </main>
+  );
+}
+
+function NoticeBanner({ notice }: { notice: Notice | null }) {
+  if (!notice) {
+    return null;
+  }
+
+  const toneClassName =
+    notice.tone === "danger"
+      ? "border-red-300/40 bg-red-500/20 text-red-50"
+      : notice.tone === "warning"
+        ? "border-amber-300/40 bg-amber-400/20 text-amber-50"
+        : "border-teal-200/40 bg-teal-300/15 text-teal-50";
+
+  return (
+    <div className="pointer-events-none fixed left-1/2 top-5 z-40 w-[min(calc(100%-2rem),720px)] -translate-x-1/2 px-1">
+      <div
+        className={`rounded-lg border px-4 py-3 text-center shadow-2xl shadow-black/30 backdrop-blur ${toneClassName}`}
+        role="status"
+      >
+        <p className="text-base font-black sm:text-xl">{notice.message}</p>
+        {notice.detail ? (
+          <p className="mt-1 text-sm font-semibold opacity-90 sm:text-base">
+            {notice.detail}
+          </p>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -371,62 +672,213 @@ function ExamSetupPanel({
 }
 
 function ClockDisplay({
-  settings,
-  now,
-  remainingMilliseconds,
-  isEnded,
-  hasStarted,
+  examTitle,
+  instructions,
+  nowMs,
+  endDateTime,
+  remainingMs,
+  status,
   className = ""
 }: {
-  settings: ExamSettings;
-  now: Date | null;
-  remainingMilliseconds: number;
-  isEnded: boolean;
-  hasStarted: boolean;
+  examTitle: string;
+  instructions: string;
+  nowMs: number | null;
+  endDateTime: number | null;
+  remainingMs: number;
+  status: "waiting" | "running" | "paused" | "ended";
   className?: string;
 }) {
+  const statusLabel =
+    status === "paused"
+      ? "일시정지 중"
+      : status === "ended"
+        ? "시험 종료"
+        : status === "running"
+          ? "시험 진행 중"
+          : "대기 화면";
+
   return (
     <section
       className={`flex min-h-[calc(100dvh-8.5rem)] flex-col rounded-lg border border-white/10 bg-black/25 px-4 py-6 shadow-2xl shadow-black/20 sm:px-6 lg:px-10 ${className}`}
     >
       <div className="text-center">
-        <p className="text-sm font-semibold uppercase tracking-[0.24em] text-slate-300">
-          {hasStarted ? "시험 진행 중" : "대기 화면"}
+        <p
+          className={`text-sm font-semibold uppercase tracking-[0.24em] ${
+            status === "paused"
+              ? "text-amber-200"
+              : status === "ended"
+                ? "text-red-200"
+                : "text-slate-300"
+          }`}
+        >
+          {statusLabel}
         </p>
         <h2 className="mt-3 break-keep text-3xl font-black text-white sm:text-5xl lg:text-6xl">
-          {settings.title}
+          {examTitle}
         </h2>
       </div>
 
       <div className="flex flex-1 flex-col items-center justify-center py-8 text-center">
-        {isEnded ? (
-          <p className="mb-4 rounded-md bg-red-500/20 px-5 py-2 text-xl font-black text-red-100 ring-1 ring-red-300/30 sm:text-3xl">
-            시험 종료
+        {status === "paused" ? (
+          <p className="mb-4 rounded-md bg-amber-400/20 px-5 py-2 text-xl font-black text-amber-100 ring-1 ring-amber-300/30 sm:text-3xl">
+            일시정지 중
           </p>
+        ) : null}
+        {status === "ended" ? (
+          <div className="mb-4 space-y-2">
+            <p className="rounded-md bg-red-500/20 px-5 py-2 text-xl font-black text-red-100 ring-1 ring-red-300/30 sm:text-3xl">
+              시험 종료
+            </p>
+            <p className="text-2xl font-black text-red-50 sm:text-4xl">
+              답안을 제출해주세요
+            </p>
+          </div>
         ) : null}
         <p
           aria-live="polite"
           className={`font-mono text-6xl font-black leading-none tabular-nums sm:text-8xl md:text-9xl lg:text-[10rem] xl:text-[12rem] ${
-            isEnded ? "text-red-200" : "text-teal-100"
+            status === "ended"
+              ? "text-red-200"
+              : status === "paused"
+                ? "text-amber-100"
+                : "text-teal-100"
           }`}
         >
-          {now ? formatDuration(remainingMilliseconds) : "--:--:--"}
+          {nowMs ? formatDuration(remainingMs) : "--:--:--"}
         </p>
       </div>
 
       <div className="space-y-5">
         <div className="mx-auto grid max-w-3xl grid-cols-1 gap-3 sm:grid-cols-2">
-          <InfoRow label="현재 시각" value={now ? formatClockTime(now) : "--:--:--"} />
-          <InfoRow label="종료 시각" value={settings.endTime || "--:--"} />
+          <InfoRow
+            label="현재 시각"
+            value={nowMs ? formatClockTime(new Date(nowMs)) : "--:--:--"}
+          />
+          <InfoRow
+            label="종료 시각"
+            value={endDateTime ? formatTimeOnly(new Date(endDateTime)) : "--:--"}
+          />
         </div>
 
-        {settings.notice.trim() ? (
+        {instructions.trim() ? (
           <div className="mx-auto max-w-5xl rounded-lg border border-white/10 bg-white/10 px-4 py-4 text-center text-lg font-semibold leading-8 text-slate-100 sm:text-2xl sm:leading-10">
-            <p className="whitespace-pre-line break-keep">{settings.notice}</p>
+            <p className="whitespace-pre-line break-keep">{instructions}</p>
           </div>
         ) : null}
       </div>
     </section>
+  );
+}
+
+function SupervisorControls({
+  isPaused,
+  fullscreenStatus,
+  isFullscreen,
+  shortcutHelpOpen,
+  onAdjust,
+  onTogglePause,
+  onEndNow,
+  onToggleFullscreen,
+  onToggleHelp
+}: {
+  isPaused: boolean;
+  fullscreenStatus: FullscreenStatus;
+  isFullscreen: boolean;
+  shortcutHelpOpen: boolean;
+  onAdjust: (minutes: number) => void;
+  onTogglePause: () => void;
+  onEndNow: () => void;
+  onToggleFullscreen: () => void;
+  onToggleHelp: () => void;
+}) {
+  return (
+    <aside className="fixed bottom-4 right-4 z-30 w-[min(calc(100vw-2rem),360px)] rounded-lg border border-white/10 bg-slate-950/55 p-3 text-white shadow-2xl shadow-black/30 backdrop-blur transition hover:bg-slate-950/85 focus-within:bg-slate-950/90">
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <p className="text-xs font-bold uppercase tracking-[0.18em] text-slate-300">
+          감독 컨트롤
+        </p>
+        <button
+          type="button"
+          aria-label="단축키 도움말 열기 또는 닫기"
+          onClick={onToggleHelp}
+          className="rounded-md border border-white/10 px-2 py-1 text-xs font-bold text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-teal-200"
+        >
+          단축키
+        </button>
+      </div>
+
+      <div className="grid grid-cols-4 gap-2">
+        <ControlButton label="+1분" ariaLabel="시험 시간 1분 연장" onClick={() => onAdjust(1)} />
+        <ControlButton label="+5분" ariaLabel="시험 시간 5분 연장" onClick={() => onAdjust(5)} />
+        <ControlButton label="-1분" ariaLabel="시험 시간 1분 단축" onClick={() => onAdjust(-1)} />
+        <ControlButton label="-5분" ariaLabel="시험 시간 5분 단축" onClick={() => onAdjust(-5)} />
+      </div>
+
+      <div className="mt-2 grid grid-cols-3 gap-2">
+        <ControlButton
+          label={isPaused ? "재개" : "일시정지"}
+          ariaLabel={isPaused ? "시험 재개" : "시험 일시정지"}
+          onClick={onTogglePause}
+          tone={isPaused ? "info" : "warning"}
+        />
+        <ControlButton
+          label="즉시 종료"
+          ariaLabel="시험 즉시 종료"
+          onClick={onEndNow}
+          tone="danger"
+        />
+        <ControlButton
+          label={isFullscreen ? "화면 해제" : "전체화면"}
+          ariaLabel={isFullscreen ? "전체화면 해제" : "전체화면으로 보기"}
+          onClick={onToggleFullscreen}
+          disabled={fullscreenStatus !== "supported"}
+        />
+      </div>
+
+      {shortcutHelpOpen ? (
+        <div className="mt-3 rounded-md border border-white/10 bg-black/30 p-3 text-xs leading-5 text-slate-300">
+          <p>Space 일시정지/재개</p>
+          <p>+ 또는 = +1분 / Shift++ +5분</p>
+          <p>- -1분 / Shift+- -5분</p>
+          <p>E 즉시 종료 / F 전체화면</p>
+        </div>
+      ) : null}
+    </aside>
+  );
+}
+
+function ControlButton({
+  label,
+  ariaLabel,
+  onClick,
+  tone = "default",
+  disabled = false
+}: {
+  label: string;
+  ariaLabel: string;
+  onClick: () => void;
+  tone?: "default" | "info" | "warning" | "danger";
+  disabled?: boolean;
+}) {
+  const toneClassName =
+    tone === "danger"
+      ? "border-red-300/20 bg-red-500/20 text-red-50 hover:bg-red-500/30"
+      : tone === "warning"
+        ? "border-amber-300/20 bg-amber-400/20 text-amber-50 hover:bg-amber-400/30"
+        : tone === "info"
+          ? "border-teal-200/20 bg-teal-300/20 text-teal-50 hover:bg-teal-300/30"
+          : "border-white/10 bg-white/10 text-white hover:bg-white/15";
+
+  return (
+    <button
+      type="button"
+      aria-label={ariaLabel}
+      onClick={onClick}
+      disabled={disabled}
+      className={`min-h-11 rounded-md border px-2 py-2 text-sm font-black transition focus:outline-none focus:ring-2 focus:ring-teal-200 disabled:cursor-not-allowed disabled:opacity-45 ${toneClassName}`}
+    >
+      {label}
+    </button>
   );
 }
 
