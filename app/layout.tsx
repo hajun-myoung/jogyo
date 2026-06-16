@@ -13,13 +13,13 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL("https://clock.jogyo.web.app"),
+  metadataBase: new URL("https://jogyo-3cab9.web.app/"),
   title: "Jogyo Clock",
   description: "조교를 위한 스마트 시험 시계",
   openGraph: {
     title: "Jogyo Clock",
     description: "정확한 시간, 공정한 시험",
-    url: "https://clock.jogyo.web.app",
+    url: "https://jogyo-3cab9.web.app/",
     siteName: "Jogyo Clock",
     locale: "ko_KR",
     type: "website",
