@@ -1,15 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { getFirebaseServices } from "../../lib/firebase";
 import {
+  getSharedClock,
   subscribeSharedClock,
   type SharedClock
 } from "../../lib/shareStorage";
 import { CLOCK_THEMES } from "../../lib/themes";
 
 const MINUTE_MS = 60 * 1000;
+const SHARE_POLL_INTERVAL_MS = 2000;
 
 function padTime(value: number) {
   return value.toString().padStart(2, "0");
@@ -75,6 +77,23 @@ export default function ShareViewerPage() {
   const [errorMessage, setErrorMessage] = useState("");
   const [isFullscreen, setIsFullscreen] = useState(false);
 
+  const applySharedClock = useCallback((nextSharedClock: SharedClock | null) => {
+    setSharedClock(nextSharedClock);
+    setIsLoading(false);
+
+    if (!nextSharedClock || !nextSharedClock.isPublic) {
+      setErrorMessage("공유 시계를 찾을 수 없거나 공개가 중지되었습니다.");
+      return;
+    }
+
+    if (nextSharedClock.expiresAt && nextSharedClock.expiresAt <= Date.now()) {
+      setErrorMessage("공유 시계가 만료되었습니다.");
+      return;
+    }
+
+    setErrorMessage("");
+  }, []);
+
   useEffect(() => {
     const tick = window.setInterval(() => {
       setNowMs(Date.now());
@@ -92,33 +111,51 @@ export default function ShareViewerPage() {
       return;
     }
 
+    let isMounted = true;
+    let hasLoadedOnce = false;
+    const refreshSharedClock = async () => {
+      try {
+        const nextSharedClock = await getSharedClock({
+          db: services.db,
+          shareId,
+        });
+
+        if (isMounted) {
+          hasLoadedOnce = true;
+          applySharedClock(nextSharedClock);
+        }
+      } catch {
+        if (isMounted && !hasLoadedOnce) {
+          setErrorMessage("공유 시계를 불러오지 못했습니다.");
+          setIsLoading(false);
+        }
+      }
+    };
+
+    void refreshSharedClock();
+
+    const pollId = window.setInterval(() => {
+      void refreshSharedClock();
+    }, SHARE_POLL_INTERVAL_MS);
+
     const unsubscribe = subscribeSharedClock({
       db: services.db,
       shareId,
       onNext: (nextSharedClock) => {
-        setSharedClock(nextSharedClock);
-        setIsLoading(false);
-
-        if (!nextSharedClock || !nextSharedClock.isPublic) {
-          setErrorMessage("공유 시계를 찾을 수 없거나 공개가 중지되었습니다.");
-          return;
-        }
-
-        if (nextSharedClock.expiresAt && nextSharedClock.expiresAt <= Date.now()) {
-          setErrorMessage("공유 시계가 만료되었습니다.");
-          return;
-        }
-
-        setErrorMessage("");
+        hasLoadedOnce = true;
+        applySharedClock(nextSharedClock);
       },
       onError: () => {
-        setErrorMessage("공유 시계를 불러오지 못했습니다.");
-        setIsLoading(false);
+        void refreshSharedClock();
       }
     });
 
-    return () => unsubscribe();
-  }, [shareId]);
+    return () => {
+      isMounted = false;
+      window.clearInterval(pollId);
+      unsubscribe();
+    };
+  }, [applySharedClock, shareId]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {

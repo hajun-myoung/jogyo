@@ -1,5 +1,6 @@
 import {
   doc,
+  getDocFromServer,
   onSnapshot,
   setDoc,
   updateDoc,
@@ -116,6 +117,22 @@ export async function updateSharedClock({
   await setDoc(doc(db, "sharedClocks", sharedClock.id), sharedClock, {
     merge: true
   });
+}
+
+export async function getSharedClock({
+  db,
+  shareId
+}: {
+  db: Firestore;
+  shareId: string;
+}) {
+  const snapshot = await getDocFromServer(doc(db, "sharedClocks", shareId));
+
+  if (!snapshot.exists()) {
+    return null;
+  }
+
+  return normalizeSharedClock(snapshot.data());
 }
 
 export async function stopSharedClock({
