@@ -1,4 +1,9 @@
-export type ThemeId = "defaultDark" | "crimson" | "highContrast" | "light";
+export type ThemeId =
+  | "defaultDark"
+  | "crimson"
+  | "royalBlue"
+  | "highContrast"
+  | "light";
 
 export type ClockTheme = {
   id: ThemeId;
@@ -39,8 +44,8 @@ export const CLOCK_THEMES: Record<ThemeId, ClockTheme> = {
   },
   crimson: {
     id: "crimson",
-    name: "크림슨",
-    description: "어두운 와인/블랙 배경과 크림슨 강조",
+    name: "크림슨 레드(고려대)",
+    description: "어두운 와인/블랙 배경과 고려대 크림슨 강조",
     pageClassName:
       "bg-[radial-gradient(circle_at_top,#881337_0%,#111827_46%,#030712_100%)] text-white",
     panelClassName:
@@ -56,6 +61,26 @@ export const CLOCK_THEMES: Record<ThemeId, ClockTheme> = {
     inputClassName:
       "border-rose-200/10 bg-white/10 text-white placeholder:text-rose-100/40 focus:border-rose-200 focus:ring-rose-200/30",
     infoCardClassName: "border-rose-200/10 bg-zinc-950/65 text-white"
+  },
+  royalBlue: {
+    id: "royalBlue",
+    name: "로얄 블루(연세대)",
+    description: "연세대 로얄 블루 기반의 깊은 파랑 테마",
+    pageClassName:
+      "bg-[radial-gradient(circle_at_top,#005eb8_0%,#003876_38%,#020617_100%)] text-white",
+    panelClassName:
+      "border-sky-100/15 bg-blue-950/75 text-white shadow-black/30",
+    clockPanelClassName:
+      "border-sky-100/15 bg-blue-950/35 text-white shadow-black/20",
+    primaryTextClassName: "text-white",
+    secondaryTextClassName: "text-sky-50",
+    mutedTextClassName: "text-sky-100/75",
+    accentClassName: "text-sky-100",
+    buttonClassName:
+      "bg-sky-200 text-blue-950 hover:bg-white focus:ring-sky-100",
+    inputClassName:
+      "border-sky-100/15 bg-white/10 text-white placeholder:text-sky-100/40 focus:border-sky-200 focus:ring-sky-200/30",
+    infoCardClassName: "border-sky-100/15 bg-blue-950/65 text-white"
   },
   highContrast: {
     id: "highContrast",
@@ -100,6 +125,7 @@ export function normalizeThemeId(value: unknown): ThemeId {
   if (
     value === "defaultDark" ||
     value === "crimson" ||
+    value === "royalBlue" ||
     value === "highContrast" ||
     value === "light"
   ) {

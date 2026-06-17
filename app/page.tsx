@@ -90,6 +90,40 @@ const NOTICE_TIMEOUT_MS = 4000;
 const LAST_SETTINGS_DEBOUNCE_MS = 500;
 const LOGO_MAX_BYTES = 1024 * 1024;
 
+type DefaultLogoPreset = {
+  id: string;
+  name: string;
+  src: string;
+};
+
+const DEFAULT_LOGO_PRESETS: DefaultLogoPreset[] = [
+  {
+    id: "snu",
+    name: "서울대",
+    src: "/logos/snu.jpg",
+  },
+  {
+    id: "korea",
+    name: "고려대",
+    src: "/logos/korea.png",
+  },
+  {
+    id: "yonsei",
+    name: "연세대",
+    src: "/logos/yonsei.png",
+  },
+  {
+    id: "kaist",
+    name: "카이스트",
+    src: "/logos/kaist.jpg",
+  },
+  {
+    id: "postech",
+    name: "포항공대",
+    src: "/logos/postech.jpg",
+  },
+];
+
 function padTime(value: number) {
   return value.toString().padStart(2, "0");
 }
@@ -1474,6 +1508,14 @@ export default function ExamClockPage() {
               onThemeChange={setThemeId}
               onOrganizationNameChange={setOrganizationName}
               onLogoUpload={handleLogoUpload}
+              onDefaultLogoSelect={(preset) => {
+                setLogoDataUrl(preset.src);
+                showNotice({
+                  message: "기본 로고가 적용되었습니다",
+                  detail: preset.name,
+                  tone: "info",
+                });
+              }}
               onLogoDelete={() => {
                 setLogoDataUrl(null);
                 showNotice({
@@ -1630,6 +1672,7 @@ function ExamSetupPanel({
   onThemeChange,
   onOrganizationNameChange,
   onLogoUpload,
+  onDefaultLogoSelect,
   onLogoDelete,
   onPresetNameChange,
   onSaveAsPreset,
@@ -1678,6 +1721,7 @@ function ExamSetupPanel({
   onThemeChange: (themeId: ThemeId) => void;
   onOrganizationNameChange: (value: string) => void;
   onLogoUpload: (event: ChangeEvent<HTMLInputElement>) => void;
+  onDefaultLogoSelect: (preset: DefaultLogoPreset) => void;
   onLogoDelete: () => void;
   onPresetNameChange: (value: string) => void;
   onSaveAsPreset: () => void;
@@ -1802,6 +1846,28 @@ function ExamSetupPanel({
           </Field>
 
           <Field label="로고" htmlFor="clock-logo" theme={theme}>
+            <div className="mb-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+              {DEFAULT_LOGO_PRESETS.map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => onDefaultLogoSelect(preset)}
+                  className="flex min-h-14 items-center gap-2 rounded-md border border-current/15 px-2 py-2 text-left transition hover:bg-current/10 focus:outline-none focus:ring-2 focus:ring-teal-200"
+                >
+                  <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-white p-1">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={preset.src}
+                      alt=""
+                      className="max-h-full max-w-full object-contain"
+                    />
+                  </span>
+                  <span className="min-w-0 truncate text-sm font-bold">
+                    {preset.name}
+                  </span>
+                </button>
+              ))}
+            </div>
             <input
               id="clock-logo"
               type="file"
@@ -1817,7 +1883,7 @@ function ExamSetupPanel({
                   alt={`${
                     organizationName.trim() || DEFAULT_ORGANIZATION_NAME
                   } 로고`}
-                  className="h-12 max-w-24 rounded-md object-contain"
+                  className="h-12 max-w-24 rounded-md bg-white p-1 object-contain"
                 />
               ) : (
                 <p className={`text-sm ${theme.mutedTextClassName}`}>
