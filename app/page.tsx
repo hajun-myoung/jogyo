@@ -5,6 +5,7 @@ import {
   FormEvent,
   useCallback,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import {
@@ -89,6 +90,7 @@ const MINUTE_MS = 60 * 1000;
 const NOTICE_TIMEOUT_MS = 4000;
 const LAST_SETTINGS_DEBOUNCE_MS = 500;
 const LOGO_MAX_BYTES = 1024 * 1024;
+const SHARE_AUTO_UPDATE_DEBOUNCE_MS = 700;
 
 type DefaultLogoPreset = {
   id: string;
@@ -270,6 +272,24 @@ function getPublicShareUrl(shareId: string) {
   return `${window.location.origin}/share/${shareId}`;
 }
 
+function getSharedClockSyncSignature(sharedClock: SharedClock) {
+  return JSON.stringify({
+    roomId: sharedClock.roomId,
+    roomName: sharedClock.roomName,
+    examTitle: sharedClock.examTitle,
+    endDateTime: sharedClock.endDateTime,
+    endTimeInput: sharedClock.endTimeInput,
+    instructions: sharedClock.instructions,
+    themeId: sharedClock.themeId,
+    organizationName: sharedClock.organizationName,
+    logoDataUrl: sharedClock.logoDataUrl,
+    isPaused: sharedClock.isPaused,
+    pausedRemainingMs: sharedClock.pausedRemainingMs,
+    status: sharedClock.status,
+    isPublic: sharedClock.isPublic,
+  });
+}
+
 export default function ExamClockPage() {
   const [examTitle, setExamTitle] = useState("기말고사");
   const [instructions, setInstructions] = useState(DEFAULT_NOTICE);
@@ -315,6 +335,7 @@ export default function ExamClockPage() {
   const [activeSharedClock, setActiveSharedClock] =
     useState<SharedClock | null>(null);
   const [shareAction, setShareAction] = useState<ShareAction>(null);
+  const lastAutoShareSignatureRef = useRef("");
 
   const theme = CLOCK_THEMES[themeId];
 
@@ -578,6 +599,7 @@ export default function ExamClockPage() {
       : isStarted
         ? "running"
         : "waiting";
+  const sharePausedRemainingMs = isPaused ? remainingMs : null;
 
   const addMinutesToEnd = useCallback(
     (minutes: number) => {
@@ -937,10 +959,12 @@ export default function ExamClockPage() {
     });
   };
 
-  const getSelectedRoom = () =>
-    rooms.find((room) => room.id === selectedRoomId) ?? null;
+  const getSelectedRoom = useCallback(
+    () => rooms.find((room) => room.id === selectedRoomId) ?? null,
+    [rooms, selectedRoomId],
+  );
 
-  const getShareStatus = (): ShareStatus => {
+  const getShareStatus = useCallback((): ShareStatus => {
     if (currentStatus === "paused") {
       return "paused";
     }
@@ -950,36 +974,109 @@ export default function ExamClockPage() {
     }
 
     return "running";
-  };
+  }, [currentStatus]);
 
-  const buildSharedClock = (
-    shareId: string,
-    createdAt: number,
-  ): SharedClock => {
-    const selectedRoom = getSelectedRoom();
-    const timestamp = Date.now();
+  const buildSharedClock = useCallback(
+    (shareId: string, createdAt: number): SharedClock => {
+      const selectedRoom = getSelectedRoom();
+      const timestamp = Date.now();
 
-    return {
-      id: shareId,
-      ownerUid: authUser?.uid ?? "",
-      roomId: selectedRoom?.id ?? null,
-      roomName: selectedRoom?.name ?? "",
-      examTitle: examTitle.trim() || "기말고사",
-      endDateTime: endDateTime ?? timestamp,
-      endTimeInput: draftSettings.endTime,
+      return {
+        id: shareId,
+        ownerUid: authUser?.uid ?? "",
+        roomId: selectedRoom?.id ?? null,
+        roomName: selectedRoom?.name ?? "",
+        examTitle: examTitle.trim() || "기말고사",
+        endDateTime: endDateTime ?? timestamp,
+        endTimeInput:
+          endDateTime !== null
+            ? formatTimeOnly(new Date(endDateTime))
+            : draftSettings.endTime,
+        instructions,
+        themeId,
+        organizationName: organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
+        logoDataUrl: logoDataUrl || null,
+        isPaused,
+        pausedRemainingMs: sharePausedRemainingMs,
+        status: getShareStatus(),
+        isPublic: true,
+        createdAt,
+        updatedAt: timestamp,
+        expiresAt: null,
+      };
+    },
+    [
+      authUser?.uid,
+      draftSettings.endTime,
+      endDateTime,
+      examTitle,
+      getSelectedRoom,
+      getShareStatus,
       instructions,
-      themeId,
-      organizationName: organizationName.trim() || DEFAULT_ORGANIZATION_NAME,
-      logoDataUrl: logoDataUrl || null,
       isPaused,
-      pausedRemainingMs: isPaused ? remainingMs : null,
-      status: getShareStatus(),
-      isPublic: true,
-      createdAt,
-      updatedAt: timestamp,
-      expiresAt: null,
+      logoDataUrl,
+      organizationName,
+      sharePausedRemainingMs,
+      themeId,
+    ],
+  );
+
+  useEffect(() => {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser ||
+      !activeSharedClock?.isPublic ||
+      shareAction === "create" ||
+      shareAction === "update" ||
+      shareAction === "stop"
+    ) {
+      return;
+    }
+
+    const sharedClock = buildSharedClock(
+      activeSharedClock.id,
+      activeSharedClock.createdAt,
+    );
+    const signature = getSharedClockSyncSignature(sharedClock);
+
+    if (lastAutoShareSignatureRef.current === signature) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void updateSharedClock({
+        db: firebaseServices.db,
+        sharedClock,
+      })
+        .then(() => {
+          lastAutoShareSignatureRef.current = signature;
+          setActiveSharedClock((current) =>
+            current?.id === sharedClock.id ? sharedClock : current,
+          );
+        })
+        .catch((error) => {
+          showNotice({
+            message: "공유 시계 자동 업데이트에 실패했습니다",
+            detail: getShortErrorMessage(error),
+            tone: "warning",
+          });
+        });
+    }, SHARE_AUTO_UPDATE_DEBOUNCE_MS);
+
+    return () => {
+      window.clearTimeout(timeoutId);
     };
-  };
+  }, [
+    activeSharedClock?.createdAt,
+    activeSharedClock?.id,
+    activeSharedClock?.isPublic,
+    authUser,
+    buildSharedClock,
+    firebaseServices,
+    shareAction,
+    showNotice,
+  ]);
 
   const handleCreateRoom = async () => {
     if (
@@ -1157,6 +1254,8 @@ export default function ExamClockPage() {
       }
 
       setActiveSharedClock(sharedClock);
+      lastAutoShareSignatureRef.current =
+        getSharedClockSyncSignature(sharedClock);
       setRooms((currentRooms) =>
         currentRooms.map((room) =>
           room.id === sharedClock.roomId
@@ -1202,6 +1301,8 @@ export default function ExamClockPage() {
         sharedClock,
       });
       setActiveSharedClock(sharedClock);
+      lastAutoShareSignatureRef.current =
+        getSharedClockSyncSignature(sharedClock);
       showNotice({
         message: "공유 시계가 업데이트되었습니다",
         detail: `마지막 업데이트: ${formatClockTime(new Date(sharedClock.updatedAt))}`,
@@ -1239,6 +1340,7 @@ export default function ExamClockPage() {
         isPublic: false,
         updatedAt: Date.now(),
       });
+      lastAutoShareSignatureRef.current = "";
       showNotice({
         message: "공유가 중지되었습니다",
         tone: "warning",
