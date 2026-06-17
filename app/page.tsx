@@ -258,6 +258,7 @@ export default function ExamClockPage() {
   const [setupOpen, setSetupOpen] = useState(true);
   const [isStarted, setIsStarted] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
+  const [isShow, setIsShow] = useState(true);
   const [pausedAt, setPausedAt] = useState<number | null>(null);
   const [pausedRemainingMs, setPausedRemainingMs] = useState<number | null>(
     null,
@@ -409,7 +410,11 @@ export default function ExamClockPage() {
   }, []);
 
   useEffect(() => {
-    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
       setRooms([]);
       setSelectedRoomId("");
       setRoomNameInput("");
@@ -433,7 +438,7 @@ export default function ExamClockPage() {
         setSelectedRoomId((currentRoomId) =>
           currentRoomId && nextRooms.some((room) => room.id === currentRoomId)
             ? currentRoomId
-            : nextRooms[0]?.id ?? "",
+            : (nextRooms[0]?.id ?? ""),
         );
       })
       .catch((error) => {
@@ -913,7 +918,10 @@ export default function ExamClockPage() {
     return "running";
   };
 
-  const buildSharedClock = (shareId: string, createdAt: number): SharedClock => {
+  const buildSharedClock = (
+    shareId: string,
+    createdAt: number,
+  ): SharedClock => {
     const selectedRoom = getSelectedRoom();
     const timestamp = Date.now();
 
@@ -940,7 +948,11 @@ export default function ExamClockPage() {
   };
 
   const handleCreateRoom = async () => {
-    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
       return;
     }
 
@@ -982,7 +994,11 @@ export default function ExamClockPage() {
   };
 
   const handleRenameRoom = async () => {
-    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
       return;
     }
 
@@ -1031,7 +1047,11 @@ export default function ExamClockPage() {
   };
 
   const handleDeleteRoom = async () => {
-    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
       return;
     }
 
@@ -1074,7 +1094,11 @@ export default function ExamClockPage() {
   };
 
   const handleCreateShare = async () => {
-    if (!firebaseServices || firebaseServices.status === "disabled" || !authUser) {
+    if (
+      !firebaseServices ||
+      firebaseServices.status === "disabled" ||
+      !authUser
+    ) {
       return;
     }
 
@@ -1204,7 +1228,9 @@ export default function ExamClockPage() {
     setShareAction("copy");
 
     try {
-      await navigator.clipboard.writeText(getPublicShareUrl(activeSharedClock.id));
+      await navigator.clipboard.writeText(
+        getPublicShareUrl(activeSharedClock.id),
+      );
       showNotice({
         message: "공유 링크가 복사되었습니다",
         tone: "info",
@@ -1504,6 +1530,11 @@ export default function ExamClockPage() {
         onEndNow={endExamNow}
         onToggleFullscreen={handleToggleFullscreen}
         onToggleHelp={() => setShortcutHelpOpen((current) => !current)}
+        isShow={isShow}
+        onTooglePannel={() => {
+          setIsShow((cur) => !cur);
+          setShortcutHelpOpen(false);
+        }}
       />
     </main>
   );
@@ -1884,7 +1915,9 @@ function ExamSetupPanel({
           firebaseServices={firebaseServices}
           authUser={authUser}
           activeSharedClock={activeSharedClock}
-          selectedRoom={rooms.find((room) => room.id === selectedRoomId) ?? null}
+          selectedRoom={
+            rooms.find((room) => room.id === selectedRoomId) ?? null
+          }
           shareAction={shareAction}
           onCreateShare={onCreateShare}
           onUpdateShare={onUpdateShare}
@@ -2275,7 +2308,9 @@ function SharePanel({
   const firebaseDisabled =
     firebaseServices === null || firebaseServices.status === "disabled";
   const canShare = !firebaseDisabled && Boolean(authUser) && !shareAction;
-  const shareUrl = activeSharedClock ? getPublicShareUrl(activeSharedClock.id) : "";
+  const shareUrl = activeSharedClock
+    ? getPublicShareUrl(activeSharedClock.id)
+    : "";
 
   return (
     <section className="space-y-4 border-t border-current/10 pt-4">
@@ -2284,12 +2319,15 @@ function SharePanel({
           공유 링크 / QR
         </h2>
         <p className={`mt-1 text-sm ${theme.mutedTextClassName}`}>
-          학생 또는 보조 감독자가 이 링크를 열면 읽기 전용 시계를 볼 수 있습니다.
+          학생 또는 보조 감독자가 이 링크를 열면 읽기 전용 시계를 볼 수
+          있습니다.
         </p>
       </div>
 
       {selectedRoom ? (
-        <p className={`rounded-md border border-current/10 bg-current/5 px-3 py-2 text-sm ${theme.secondaryTextClassName}`}>
+        <p
+          className={`rounded-md border border-current/10 bg-current/5 px-3 py-2 text-sm ${theme.secondaryTextClassName}`}
+        >
           선택된 강의실: <span className="font-black">{selectedRoom.name}</span>
         </p>
       ) : null}
@@ -2322,7 +2360,8 @@ function SharePanel({
               {activeSharedClock.isPublic ? "공유 중" : "공유 중지됨"}
             </p>
             <p className={`text-xs ${theme.mutedTextClassName}`}>
-              마지막 업데이트 {formatClockTime(new Date(activeSharedClock.updatedAt))}
+              마지막 업데이트{" "}
+              {formatClockTime(new Date(activeSharedClock.updatedAt))}
             </p>
           </div>
           <input
@@ -2504,6 +2543,8 @@ function SupervisorControls({
   onEndNow,
   onToggleFullscreen,
   onToggleHelp,
+  isShow,
+  onTooglePannel,
 }: {
   isPaused: boolean;
   fullscreenStatus: FullscreenStatus;
@@ -2514,66 +2555,85 @@ function SupervisorControls({
   onEndNow: () => void;
   onToggleFullscreen: () => void;
   onToggleHelp: () => void;
+  isShow: boolean;
+  onTooglePannel: () => void;
 }) {
   return (
     <aside className="fixed bottom-4 right-4 z-30 w-[min(calc(100vw-2rem),360px)] rounded-lg border border-white/10 bg-slate-950/55 p-3 text-white shadow-2xl shadow-black/30 backdrop-blur transition hover:bg-slate-950/85 focus-within:bg-slate-950/90">
-      <div className="mb-2 flex items-center justify-between gap-2">
+      <div
+        className={`${isShow ? "mb-2" : ""} flex items-center justify-between gap-2`}
+      >
         <p className="text-xs font-bold uppercase tracking-[0.18em] text-slate-300">
           감독 컨트롤
         </p>
-        <button
-          type="button"
-          aria-label="단축키 도움말 열기 또는 닫기"
-          onClick={onToggleHelp}
-          className="rounded-md border border-white/10 px-2 py-1 text-xs font-bold text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-teal-200"
-        >
-          단축키
-        </button>
+        <div>
+          {isShow ? (
+            <button
+              type="button"
+              aria-label="단축키 도움말 열기 또는 닫기"
+              onClick={onToggleHelp}
+              className="rounded-md border border-white/10 px-2 py-1 text-xs font-bold text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-teal-200 mr-2"
+            >
+              단축키
+            </button>
+          ) : null}
+          <button
+            type="button"
+            aria-label="관리자 패널 열기 또는 닫기"
+            onClick={onTooglePannel}
+            className="rounded-md border border-white/10 px-2 py-1 text-xs font-bold text-slate-200 transition hover:bg-white/10 focus:outline-none focus:ring-2 focus:ring-teal-200"
+          >
+            {isShow ? "닫기" : "열기"}
+          </button>
+        </div>
       </div>
 
-      <div className="grid grid-cols-4 gap-2">
-        <ControlButton
-          label="+1분"
-          ariaLabel="시험 시간 1분 연장"
-          onClick={() => onAdjust(1)}
-        />
-        <ControlButton
-          label="+5분"
-          ariaLabel="시험 시간 5분 연장"
-          onClick={() => onAdjust(5)}
-        />
-        <ControlButton
-          label="-1분"
-          ariaLabel="시험 시간 1분 단축"
-          onClick={() => onAdjust(-1)}
-        />
-        <ControlButton
-          label="-5분"
-          ariaLabel="시험 시간 5분 단축"
-          onClick={() => onAdjust(-5)}
-        />
-      </div>
-
-      <div className="mt-2 grid grid-cols-3 gap-2">
-        <ControlButton
-          label={isPaused ? "재개" : "일시정지"}
-          ariaLabel={isPaused ? "시험 재개" : "시험 일시정지"}
-          onClick={onTogglePause}
-          tone={isPaused ? "info" : "warning"}
-        />
-        <ControlButton
-          label="즉시 종료"
-          ariaLabel="시험 즉시 종료"
-          onClick={onEndNow}
-          tone="danger"
-        />
-        <ControlButton
-          label={isFullscreen ? "화면 해제" : "전체화면"}
-          ariaLabel={isFullscreen ? "전체화면 해제" : "전체화면으로 보기"}
-          onClick={onToggleFullscreen}
-          disabled={fullscreenStatus !== "supported"}
-        />
-      </div>
+      {isShow ? (
+        <>
+          <div className="grid grid-cols-4 gap-2">
+            <ControlButton
+              label="+1분"
+              ariaLabel="시험 시간 1분 연장"
+              onClick={() => onAdjust(1)}
+            />
+            <ControlButton
+              label="+5분"
+              ariaLabel="시험 시간 5분 연장"
+              onClick={() => onAdjust(5)}
+            />
+            <ControlButton
+              label="-1분"
+              ariaLabel="시험 시간 1분 단축"
+              onClick={() => onAdjust(-1)}
+            />
+            <ControlButton
+              label="-5분"
+              ariaLabel="시험 시간 5분 단축"
+              onClick={() => onAdjust(-5)}
+            />
+          </div>
+          <div className="mt-2 grid grid-cols-3 gap-2">
+            <ControlButton
+              label={isPaused ? "재개" : "일시정지"}
+              ariaLabel={isPaused ? "시험 재개" : "시험 일시정지"}
+              onClick={onTogglePause}
+              tone={isPaused ? "info" : "warning"}
+            />
+            <ControlButton
+              label="즉시 종료"
+              ariaLabel="시험 즉시 종료"
+              onClick={onEndNow}
+              tone="danger"
+            />
+            <ControlButton
+              label={isFullscreen ? "화면 해제" : "전체화면"}
+              ariaLabel={isFullscreen ? "전체화면 해제" : "전체화면으로 보기"}
+              onClick={onToggleFullscreen}
+              disabled={fullscreenStatus !== "supported"}
+            />
+          </div>
+        </>
+      ) : null}
 
       {shortcutHelpOpen ? (
         <div className="mt-3 rounded-md border border-white/10 bg-black/30 p-3 text-xs leading-5 text-slate-300">
